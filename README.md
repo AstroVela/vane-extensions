@@ -57,16 +57,19 @@ loaded.
    ```
 
 For TestPyPI packages, the generated installation recipe keeps indexes
-isolated. It first installs ordinary dependencies from PyPI, then installs the
-exact Vane and extension wheels from TestPyPI with dependency resolution
-disabled and forced reinstallation so a matching distribution already present
-from PyPI cannot satisfy the TestPyPI step. The site build fails closed unless
-the provider and every selected Vane-owned dependency publish at least one
-non-yanked wheel. The registry never emits `--extra-index-url`, because pip
-gives no priority to the primary index and that pattern is vulnerable to
-dependency confusion.
+isolated. Every command passes pip's `--isolated` global option to ignore
+environment variables and user configuration. The recipe first installs
+ordinary dependencies from PyPI, then installs the exact Vane and extension
+wheels from TestPyPI with dependency resolution disabled and forced
+reinstallation so a matching distribution already present from PyPI cannot
+satisfy the TestPyPI step. The site build fails closed unless the provider and
+every selected Vane-owned dependency publish at least one non-yanked wheel. The
+registry never emits `--extra-index-url`, because pip gives no priority to the
+primary index and that pattern is vulnerable to dependency confusion.
 PEP 508 requirements and wheel filenames are parsed by `packaging`; `dep-logic`
 reduces compound extra markers without tying recipes to the build machine.
+Direct-URL requirements are omitted from published JSON and HTML so artifact
+locations or embedded credentials cannot leak through package metadata.
 
 `index.json` is generated deterministically from the discovery subset of the
 individual manifests and must be updated in the same pull request. Package
@@ -92,9 +95,10 @@ Vane descriptors.
 The Pages build produces one detail page and JSON document per extension. Each
 contains the reviewed documentation, install/load examples, package publication
 state, latest package version and upload time, `Requires-Python`, available
-Python/ABI/platform wheel tags, validated direct package requirements, GitHub
-stars, and download metrics when the selected index supports them. These values
-are informational and never participate in artifact resolution or trust.
+Python/ABI/platform wheel tags, validated package requirements with direct-URL
+entries omitted, GitHub stars, and download metrics when the selected index
+supports them. These values are informational and never participate in artifact
+resolution or trust.
 
 The repository is licensed under the Apache License 2.0. Each manifest records
 the license declared by its provider project; that field does not change the

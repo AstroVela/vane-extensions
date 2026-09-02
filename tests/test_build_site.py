@@ -361,7 +361,8 @@ class BuildSiteTests(unittest.TestCase):
         self.assertEqual(
             detail["installation"]["install_commands"],
             [
-                "python -m pip install --index-url https://pypi.org/simple/ "
+                "python -m pip --isolated install "
+                "--index-url https://pypi.org/simple/ "
                 f"{distribution}===0.2.0"
             ],
         )
@@ -388,6 +389,10 @@ class BuildSiteTests(unittest.TestCase):
                     (
                         f"vane-extension-optional==={optional_version}; "
                         'extra == "a" or extra == "b"'
+                    ),
+                    (
+                        "root-sdk @ https://example.invalid/root.whl ; "
+                        'extra == "sdk"'
                     ),
                 ],
             ),
@@ -438,6 +443,7 @@ class BuildSiteTests(unittest.TestCase):
             ],
         )
         self.assertIn("--index-url https://pypi.org/simple/", public_command)
+        self.assertIn("python -m pip --isolated install", public_command)
         self.assertIn("'numpy>=2'", public_command)
         self.assertIn("typing-extensions", public_command)
         self.assertIn("platform-marker", public_command)
@@ -448,6 +454,7 @@ class BuildSiteTests(unittest.TestCase):
         self.assertNotIn("optional-url", public_command)
         self.assertNotIn("--force-reinstall", public_command)
         self.assertIn("--force-reinstall", testpypi_command)
+        self.assertIn("python -m pip --isolated install", testpypi_command)
         self.assertIn("--no-deps", testpypi_command)
         self.assertIn("--only-binary=:all:", testpypi_command)
         self.assertIn("--index-url https://test.pypi.org/simple/", testpypi_command)
@@ -459,6 +466,7 @@ class BuildSiteTests(unittest.TestCase):
         self.assertNotIn(
             "--extra-index-url", "\n".join(detail["installation"]["install_commands"])
         )
+        self.assertNotIn("example.invalid", json.dumps(detail))
 
     def test_testpypi_vane_dependencies_must_use_exact_versions(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))

@@ -409,7 +409,11 @@ def _package_metadata(
             "published": True,
             "latest_version": version_text,
             "requires_python": requires_python,
-            "requires_dist": [str(requirement) for requirement in requirements],
+            "requires_dist": [
+                str(requirement)
+                for requirement in requirements
+                if requirement.url is None
+            ],
             **file_metadata,
         },
         requirements,
@@ -478,7 +482,8 @@ def _requirement_for_base_install(requirement: Requirement) -> Requirement | Non
         return base_requirement
     except (KeyError, TypeError, ValueError) as exception:
         raise SiteBuildError(
-            f"package marker cannot be evaluated for {requirement}"
+            "package marker cannot be evaluated for "
+            f"{canonicalize_name(requirement.name)}"
         ) from exception
 
 
@@ -614,6 +619,7 @@ def _testpypi_install_commands(
                     "python",
                     "-m",
                     "pip",
+                    "--isolated",
                     "install",
                     "--index-url",
                     _PACKAGE_INDEXES["pypi"]["simple"],
@@ -627,6 +633,7 @@ def _testpypi_install_commands(
                 "python",
                 "-m",
                 "pip",
+                "--isolated",
                 "install",
                 "--force-reinstall",
                 "--no-deps",
@@ -671,6 +678,7 @@ def _installation_metadata(
                     "python",
                     "-m",
                     "pip",
+                    "--isolated",
                     "install",
                     "--index-url",
                     _PACKAGE_INDEXES["pypi"]["simple"],
