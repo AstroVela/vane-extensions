@@ -17,7 +17,9 @@ from typing import NoReturn, Protocol
 from urllib.parse import quote, urlsplit
 
 import httpx
+from dep_logic.markers import from_pkg_marker
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
+from packaging.markers import Marker
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import (
@@ -43,9 +45,6 @@ METADATA_MAX_WORKERS = 16
 PACKAGE_REQUIREMENTS_MAX_COUNT = 256
 VANE_REQUIREMENTS_MAX_COUNT = 64
 _PYTHON_TAG_RE = re.compile(r"^(?:cp|pp)([0-9])([0-9]+)$")
-_OPTIONAL_EXTRA_MARKER_RE = re.compile(
-    r'(?:^|[ (])extra\s*==\s*"[^"]+"'
-)
 _UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
@@ -261,6 +260,81 @@ def _package_requirements(
     return tuple(requirements[key] for key in sorted(requirements, key=str.casefold))
 
 
+def _package_file_metadata(
+    document: Mapping[str, object],
+    distribution_name: str,
+    version_text: str,
+    version: Version,
+) -> dict[str, object]:
+    raw_files = document.get("urls")
+    if not isinstance(raw_files, list):
+        _fail(f"package urls must be a list for {distribution_name}")
+    wheel_count = 0
+    python_versions: set[str] = set()
+    python_tags: set[str] = set()
+    abi_tags: set[str] = set()
+    platform_tags: set[str] = set()
+    upload_times: list[tuple[datetime, str]] = []
+    for raw_file in raw_files:
+        package_file = _mapping(raw_file, f"package file for {distribution_name}")
+        package_type = _string(
+            package_file.get("packagetype"), "package packagetype"
+        )
+        yanked = package_file.get("yanked", False)
+        if type(yanked) is not bool:
+            _fail(f"package yanked flag is invalid for {distribution_name}")
+        uploaded_at = _string(
+            package_file.get("upload_time_iso_8601"),
+            "package upload_time_iso_8601",
+            nullable=True,
+        )
+        if uploaded_at is not None:
+            upload_times.append(
+                (
+                    _timestamp(uploaded_at, "package upload_time_iso_8601"),
+                    uploaded_at,
+                )
+            )
+        if package_type != "bdist_wheel" or yanked:
+            continue
+        filename = _string(package_file.get("filename"), "package filename")
+        if not isinstance(filename, str):
+            _fail(f"package filename is missing for {distribution_name}")
+        try:
+            wheel_name, wheel_version, _build, wheel_tags = parse_wheel_filename(
+                filename
+            )
+        except InvalidWheelFilename as exception:
+            raise SiteBuildError(
+                f"package returned an invalid wheel filename for {distribution_name}"
+            ) from exception
+        if (
+            canonicalize_name(wheel_name) != canonicalize_name(distribution_name)
+            or wheel_version != version
+        ):
+            _fail(f"wheel identity does not match {distribution_name}=={version_text}")
+        wheel_count += 1
+        for tag in wheel_tags:
+            python_tags.add(tag.interpreter)
+            abi_tags.add(tag.abi)
+            platform_tags.add(tag.platform)
+            python_version = _python_version_from_tag(tag.interpreter)
+            if python_version is not None:
+                python_versions.add(python_version)
+
+    latest_release_uploaded_at = (
+        max(upload_times, key=lambda item: item[0])[1] if upload_times else None
+    )
+    return {
+        "wheel_count": wheel_count,
+        "python_versions": sorted(python_versions, key=Version),
+        "python_tags": sorted(python_tags),
+        "abi_tags": sorted(abi_tags),
+        "platform_tags": sorted(platform_tags),
+        "latest_release_uploaded_at": latest_release_uploaded_at,
+    }
+
+
 def _package_metadata(
     distribution_name: str, package_index: str, client: JsonMetadataClient
 ) -> tuple[dict[str, object], tuple[Requirement, ...]]:
@@ -317,62 +391,8 @@ def _package_metadata(
                 f"package Requires-Python is invalid for {distribution_name}"
             ) from exception
     requirements = _package_requirements(info, distribution_name)
-    raw_files = document.get("urls")
-    if not isinstance(raw_files, list):
-        _fail(f"package urls must be a list for {distribution_name}")
-    wheel_count = 0
-    python_versions: set[str] = set()
-    python_tags: set[str] = set()
-    abi_tags: set[str] = set()
-    platform_tags: set[str] = set()
-    upload_times: list[tuple[datetime, str]] = []
-    for raw_file in raw_files:
-        package_file = _mapping(raw_file, f"package file for {distribution_name}")
-        package_type = _string(package_file.get("packagetype"), "package packagetype")
-        yanked = package_file.get("yanked", False)
-        if type(yanked) is not bool:
-            _fail(f"package yanked flag is invalid for {distribution_name}")
-        uploaded_at = _string(
-            package_file.get("upload_time_iso_8601"),
-            "package upload_time_iso_8601",
-            nullable=True,
-        )
-        if uploaded_at is not None:
-            upload_times.append(
-                (
-                    _timestamp(uploaded_at, "package upload_time_iso_8601"),
-                    uploaded_at,
-                )
-            )
-        if package_type != "bdist_wheel" or yanked:
-            continue
-        filename = _string(package_file.get("filename"), "package filename")
-        if not isinstance(filename, str):
-            _fail(f"package filename is missing for {distribution_name}")
-        try:
-            wheel_name, wheel_version, _build, wheel_tags = parse_wheel_filename(
-                filename
-            )
-        except InvalidWheelFilename as exception:
-            raise SiteBuildError(
-                f"package returned an invalid wheel filename for {distribution_name}"
-            ) from exception
-        if (
-            canonicalize_name(wheel_name) != canonicalize_name(distribution_name)
-            or wheel_version != latest_version
-        ):
-            _fail(f"wheel identity does not match {distribution_name}=={version_text}")
-        wheel_count += 1
-        for tag in wheel_tags:
-            python_tags.add(tag.interpreter)
-            abi_tags.add(tag.abi)
-            platform_tags.add(tag.platform)
-            python_version = _python_version_from_tag(tag.interpreter)
-            if python_version is not None:
-                python_versions.add(python_version)
-
-    latest_release_uploaded_at = (
-        max(upload_times, key=lambda item: item[0])[1] if upload_times else None
+    file_metadata = _package_file_metadata(
+        document, distribution_name, version_text, latest_version
     )
     return (
         {
@@ -382,12 +402,7 @@ def _package_metadata(
             "latest_version": version_text,
             "requires_python": requires_python,
             "requires_dist": [str(requirement) for requirement in requirements],
-            "wheel_count": wheel_count,
-            "python_versions": sorted(python_versions, key=Version),
-            "python_tags": sorted(python_tags),
-            "abi_tags": sorted(abi_tags),
-            "platform_tags": sorted(platform_tags),
-            "latest_release_uploaded_at": latest_release_uploaded_at,
+            **file_metadata,
         },
         requirements,
     )
@@ -418,12 +433,24 @@ def _is_vane_distribution(distribution_name: str) -> bool:
     return normalized == "vane-ai" or normalized.startswith("vane-extension-")
 
 
-def _is_unselected_extra_requirement(requirement: Requirement) -> bool:
-    """Return whether a marker is certainly false when no extra is selected."""
+def _does_not_apply_without_extra(requirement: Requirement) -> bool:
+    """Return whether a requirement is impossible without selecting an extra."""
     if requirement.marker is None:
         return False
-    marker = str(requirement.marker)
-    return " or " not in marker and _OPTIONAL_EXTRA_MARKER_RE.search(marker) is not None
+    try:
+        extra_marker = from_pkg_marker(requirement.marker).only("extra")
+        if extra_marker.is_any():
+            return False
+        if extra_marker.is_empty():
+            return True
+        applies = Marker(str(extra_marker)).evaluate(
+            environment={"extra": ""}, context="metadata"
+        )
+    except (KeyError, TypeError, ValueError) as exception:
+        raise SiteBuildError(
+            f"package marker cannot be evaluated for {requirement}"
+        ) from exception
+    return not applies
 
 
 def _exact_internal_requirement(
@@ -480,7 +507,7 @@ def _release_requirements(
     if not isinstance(reported_version, str):
         _fail(f"package release version is missing for {distribution_name}")
     try:
-        Version(reported_version)
+        release_version = Version(reported_version)
     except InvalidVersion as exception:
         raise SiteBuildError(
             f"package release version is invalid for {distribution_name}"
@@ -493,6 +520,11 @@ def _release_requirements(
         _fail(
             f"package release metadata identity does not match {requirement}"
         )
+    file_metadata = _package_file_metadata(
+        document, distribution_name, reported_version, release_version
+    )
+    if file_metadata["wheel_count"] == 0:
+        _fail(f"{distribution_name} does not publish a non-yanked wheel")
     return reported_version, _package_requirements(info, distribution_name)
 
 
@@ -512,8 +544,6 @@ def _testpypi_install_commands(
     public_requirements: set[str] = set()
     while pending:
         requirement = pending.pop()
-        if _is_unselected_extra_requirement(requirement):
-            continue
         normalized_name = canonicalize_name(requirement.name)
         if not _is_vane_distribution(normalized_name):
             if requirement.url is not None:
@@ -523,6 +553,8 @@ def _testpypi_install_commands(
             public_requirements.add(str(requirement))
             if len(public_requirements) > PACKAGE_REQUIREMENTS_MAX_COUNT:
                 _fail(f"public dependency closure is too large for {distribution_name}")
+            continue
+        if _does_not_apply_without_extra(requirement):
             continue
 
         dependency_name, _requested_version = _exact_internal_requirement(
@@ -598,6 +630,8 @@ def _installation_metadata(
     elif not isinstance(version_text, str):
         _fail(f"published package version is missing for {distribution_name}")
     elif package_index == "testpypi":
+        if package["wheel_count"] == 0:
+            _fail(f"{distribution_name} does not publish a non-yanked wheel")
         install_commands = _testpypi_install_commands(
             distribution_name, version_text, requirements, client
         )
