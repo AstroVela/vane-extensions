@@ -1,0 +1,9 @@
+{
+  "$schema": "../../schema/extension.schema.json",
+  "extension_name": "paimon",
+  "distribution_name": "vane-extension-paimon",
+  "description": "Read and write Apache Paimon tables from Vane.",
+  "repository": "https://github.com/AstroVela/duckdb-paimon",
+  "publisher": "AstroVela",
+  "license": "Apache-2.0"
+}

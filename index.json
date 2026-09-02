@@ -1,0 +1,29 @@
+{
+  "format_version": 1,
+  "extensions": [
+    {
+      "extension_name": "iceberg",
+      "distribution_name": "vane-extension-iceberg",
+      "description": "Read and write Apache Iceberg tables from Vane.",
+      "repository": "https://github.com/AstroVela/duckdb-iceberg",
+      "publisher": "AstroVela",
+      "license": "MIT"
+    },
+    {
+      "extension_name": "lance",
+      "distribution_name": "vane-extension-lance",
+      "description": "Read and write Lance tables from Vane.",
+      "repository": "https://github.com/AstroVela/lance-duckdb",
+      "publisher": "AstroVela",
+      "license": "Apache-2.0"
+    },
+    {
+      "extension_name": "paimon",
+      "distribution_name": "vane-extension-paimon",
+      "description": "Read and write Apache Paimon tables from Vane.",
+      "repository": "https://github.com/AstroVela/duckdb-paimon",
+      "publisher": "AstroVela",
+      "license": "Apache-2.0"
+    }
+  ]
+}

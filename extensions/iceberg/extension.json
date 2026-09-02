@@ -1,0 +1,9 @@
+{
+  "$schema": "../../schema/extension.schema.json",
+  "extension_name": "iceberg",
+  "distribution_name": "vane-extension-iceberg",
+  "description": "Read and write Apache Iceberg tables from Vane.",
+  "repository": "https://github.com/AstroVela/duckdb-iceberg",
+  "publisher": "AstroVela",
+  "license": "MIT"
+}
