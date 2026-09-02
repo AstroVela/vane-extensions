@@ -19,19 +19,19 @@
     },
     "extension_name": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9_]*$",
+      "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
       "maxLength": 128
     },
     "distribution_name": {
       "type": "string",
-      "pattern": "^vane-extension-[a-z](?:[a-z0-9-]*[a-z0-9])?$",
+      "pattern": "^vane-extension-[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
       "maxLength": 256
     },
     "description": {
       "type": "string",
       "minLength": 1,
       "maxLength": 500,
-      "pattern": "^(?!\\s)(?!.*\\s$)[^\\u0000-\\u001f\\u007f]+$"
+      "pattern": "^(?!\\s)(?!.*\\s$)[^\\u0000-\\u001f\\u007f\\ud800-\\udfff]+$"
     },
     "repository": {
       "type": "string",
@@ -43,13 +43,13 @@
       "type": "string",
       "minLength": 1,
       "maxLength": 100,
-      "pattern": "^(?!\\s)(?!.*\\s$)[^\\u0000-\\u001f\\u007f]+$"
+      "pattern": "^(?!\\s)(?!.*\\s$)[^\\u0000-\\u001f\\u007f\\ud800-\\udfff]+$"
     },
     "license": {
       "type": "string",
       "minLength": 1,
       "maxLength": 200,
-      "pattern": "^(?!\\s)(?!.*\\s$)[^\\u0000-\\u001f\\u007f]+$"
+      "pattern": "^(?!\\s)(?!.*\\s$)[^\\u0000-\\u001f\\u007f\\ud800-\\udfff]+$"
     }
   }
 }

@@ -20,7 +20,9 @@ loaded.
 ## Add an extension
 
 1. Publish a Python distribution named `vane-extension-<name>` that exposes a
-   `vane.dynamic_extension_providers` entry point named `<name>`.
+   `vane.dynamic_extension_providers` entry point named `<name>`. Names use
+   lowercase ASCII letters and digits with single, non-trailing underscores so
+   every extension maps to exactly one normalized Python distribution name.
 2. Add `extensions/<name>/extension.json`, following
    `schema/extension.schema.json`.
 3. Run the same checks as CI:

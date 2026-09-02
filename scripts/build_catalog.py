@@ -19,8 +19,8 @@ MANIFEST_FILENAME = "extension.json"
 MANIFEST_MAX_BYTES = 64 * 1024
 MANIFEST_MAX_COUNT = 1024
 SCHEMA_REFERENCE = "../../schema/extension.schema.json"
-EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-DISTRIBUTION_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
+DISTRIBUTION_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 MANIFEST_KEYS = frozenset(
     {
         "$schema",
@@ -80,6 +80,8 @@ def _manifest_string(value: object, field: str, *, max_length: int) -> str:
         _fail(f"{field} exceeds its {max_length}-character limit")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         _fail(f"{field} must not contain control characters")
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        _fail(f"{field} must not contain lone Unicode surrogates")
     return value
 
 

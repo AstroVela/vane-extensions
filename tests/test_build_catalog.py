@@ -73,6 +73,22 @@ class BuildCatalogTests(unittest.TestCase):
             with self.assertRaisesRegex(CatalogBuildError, "UTF-8 JSON"):
                 build_catalog(root)
 
+    def test_manifest_text_must_not_contain_a_lone_unicode_surrogate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._manifest(root, description="\ud800")
+
+            with self.assertRaisesRegex(CatalogBuildError, "lone Unicode surrogates"):
+                build_catalog(root)
+
+    def test_extension_name_must_map_to_one_distribution_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._manifest(root, "sample__nested")
+
+            with self.assertRaisesRegex(CatalogBuildError, "extension-name syntax"):
+                build_catalog(root)
+
     def test_distribution_must_match_extension_name(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
