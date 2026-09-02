@@ -1,0 +1,9 @@
+{
+  "$schema": "../../schema/extension.schema.json",
+  "extension_name": "lance",
+  "distribution_name": "vane-extension-lance",
+  "description": "Read and write Lance tables from Vane.",
+  "repository": "https://github.com/AstroVela/lance-duckdb",
+  "publisher": "AstroVela",
+  "license": "Apache-2.0"
+}

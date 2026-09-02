@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="The public registry of Vane extension provider packages.">
+    <title>Vane extensions</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        line-height: 1.5;
+      }
+      body {
+        margin: 0 auto;
+        max-width: 70rem;
+        padding: 3rem 1.25rem;
+      }
+      header {
+        margin-bottom: 2.5rem;
+      }
+      h1 {
+        font-size: clamp(2rem, 7vw, 4rem);
+        letter-spacing: -0.05em;
+        margin: 0;
+      }
+      header p {
+        font-size: 1.15rem;
+        max-width: 52rem;
+      }
+      #extensions {
+        display: grid;
+        gap: 1rem;
+        grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+      }
+      article {
+        border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
+        border-radius: 0.8rem;
+        padding: 1.25rem;
+      }
+      article h2 {
+        margin-top: 0;
+      }
+      code {
+        overflow-wrap: anywhere;
+      }
+      .meta {
+        opacity: 0.75;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Vane extensions</h1>
+      <p>
+        Discover independently published provider packages for Vane. Install a
+        package with pip, then load its provider explicitly from Vane.
+      </p>
+      <p>
+        <a href="v1/index.json">Machine-readable catalog</a> ·
+        <a href="https://github.com/AstroVela/vane-extensions">Contribute an extension</a>
+      </p>
+    </header>
+    <main>
+      <p id="status">Loading the extension catalog…</p>
+      <section id="extensions" aria-live="polite"></section>
+    </main>
+    <script>
+      const status = document.querySelector("#status");
+      const extensions = document.querySelector("#extensions");
+
+      fetch("v1/index.json", { cache: "no-cache" })
+        .then((response) => {
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response.json();
+        })
+        .then((catalog) => {
+          status.textContent = `${catalog.extensions.length} extensions`;
+          for (const entry of catalog.extensions) {
+            const card = document.createElement("article");
+            const heading = document.createElement("h2");
+            const description = document.createElement("p");
+            const command = document.createElement("code");
+            const metadata = document.createElement("p");
+            const repository = document.createElement("a");
+
+            heading.textContent = entry.extension_name;
+            description.textContent = entry.description;
+            command.textContent = `pip install ${entry.distribution_name}`;
+            metadata.className = "meta";
+            repository.href = entry.repository;
+            repository.textContent = `${entry.publisher} · ${entry.license}`;
+            metadata.append(repository);
+            card.append(heading, description, command, metadata);
+            extensions.append(card);
+          }
+        })
+        .catch((error) => {
+          status.textContent = `Catalog unavailable: ${error.message}`;
+        });
+    </script>
+  </body>
+</html>

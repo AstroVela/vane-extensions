@@ -1,0 +1,1 @@
+"""Registry maintenance commands."""
