@@ -14,8 +14,8 @@ from scripts.build_catalog import DEFAULT_MANIFEST_ROOT, PROJECT_ROOT, load_mani
 from scripts.build_site import (
     MetadataClient,
     SiteBuildError,
-    _does_not_apply_without_extra,
     _detail_html,
+    _requirement_for_base_install,
     assemble_site,
     build_details,
 )
@@ -186,37 +186,67 @@ def _checked_in_manifest(extension_name: str) -> dict[str, object]:
 
 
 class BuildSiteTests(unittest.TestCase):
-    def test_empty_extra_marker_evaluation_is_platform_independent(self) -> None:
-        self.assertTrue(
-            _does_not_apply_without_extra(
+    def test_empty_extra_marker_reduction_is_platform_independent(self) -> None:
+        self.assertIsNone(
+            _requirement_for_base_install(
                 Requirement(
                     'vane-extension-optional===1; extra == "a" or extra == "b"'
                 )
             )
         )
-        self.assertTrue(
-            _does_not_apply_without_extra(
+        self.assertIsNone(
+            _requirement_for_base_install(
+                Requirement('vane-extension-optional===1; extra not in "docs"')
+            )
+        )
+        self.assertIsNone(
+            _requirement_for_base_install(
                 Requirement(
                     'vane-extension-optional===1; extra == "a" '
                     'and sys_platform == "linux"'
                 )
             )
         )
-        self.assertFalse(
-            _does_not_apply_without_extra(
-                Requirement(
-                    'vane-extension-optional===1; extra == "a" '
-                    'or python_version < "3.11"'
-                )
+        mixed_requirement = Requirement(
+            'vane-extension-optional===1; extra == "a" '
+            'or python_version < "3.11"'
+        )
+        mixed_base_requirement = _requirement_for_base_install(mixed_requirement)
+        self.assertIsNotNone(mixed_base_requirement)
+        self.assertEqual(
+            str(mixed_base_requirement),
+            'vane-extension-optional===1; python_version < "3.11"',
+        )
+        platform_requirement = Requirement(
+            'vane-extension-required===1; sys_platform == "extra"'
+        )
+        self.assertIs(
+            _requirement_for_base_install(platform_requirement),
+            platform_requirement,
+        )
+        base_requirement = _requirement_for_base_install(
+            Requirement('vane-ai===1; extra != "docs"')
+        )
+        self.assertIsNotNone(base_requirement)
+        self.assertEqual(str(base_requirement), "vane-ai===1")
+        self.assertIsNone(base_requirement.marker)
+        base_platform_requirement = _requirement_for_base_install(
+            Requirement(
+                'vane-ai===1; extra != "docs" and sys_platform == "linux"'
             )
         )
-        self.assertFalse(
-            _does_not_apply_without_extra(
-                Requirement(
-                    'vane-extension-required===1; sys_platform == "extra"'
-                )
+        self.assertIsNotNone(base_platform_requirement)
+        self.assertEqual(
+            str(base_platform_requirement),
+            'vane-ai===1; sys_platform == "linux"',
+        )
+        base_tautology_requirement = _requirement_for_base_install(
+            Requirement(
+                'vane-ai===1; extra == "docs" or extra != "docs"'
             )
         )
+        self.assertIsNotNone(base_tautology_requirement)
+        self.assertEqual(str(base_tautology_requirement), "vane-ai===1")
 
     def test_build_details_enriches_without_exposing_artifact_locations(self) -> None:
         details = build_details(
@@ -353,7 +383,7 @@ class BuildSiteTests(unittest.TestCase):
                 distribution,
                 provider_version,
                 requires_dist=[
-                    f"vane-ai==={vane_version}",
+                    f'vane-ai==={vane_version}; extra != "docs"',
                     f"vane-extension-avro==={avro_version}",
                     (
                         f"vane-extension-optional==={optional_version}; "
@@ -369,6 +399,10 @@ class BuildSiteTests(unittest.TestCase):
                         "numpy>=2",
                         "typing-extensions",
                         'optional-sdk; extra == "openai"',
+                        (
+                            "optional-url @ https://example.invalid/sdk.whl ; "
+                            'extra == "sdk"'
+                        ),
                         'platform-marker; sys_platform == "extra"',
                         'default-extra; extra != "openai"',
                     ],
@@ -378,7 +412,7 @@ class BuildSiteTests(unittest.TestCase):
                 _release_response(
                     "vane-extension-avro",
                     avro_version,
-                    [f"vane-ai==={vane_version}"],
+                    [f'vane-ai==={vane_version}; extra != "docs"'],
                 )
             ),
         }
@@ -395,7 +429,7 @@ class BuildSiteTests(unittest.TestCase):
         self.assertEqual(
             detail["package"]["requires_dist"],
             [
-                f"vane-ai==={vane_version}",
+                f'vane-ai==={vane_version}; extra != "docs"',
                 f"vane-extension-avro==={avro_version}",
                 (
                     f"vane-extension-optional==={optional_version}; "
@@ -410,7 +444,8 @@ class BuildSiteTests(unittest.TestCase):
         self.assertIn("default-extra", public_command)
         self.assertNotIn("test.pypi.org", public_command)
         self.assertNotIn("vane-", public_command)
-        self.assertIn("optional-sdk", public_command)
+        self.assertNotIn("optional-sdk", public_command)
+        self.assertNotIn("optional-url", public_command)
         self.assertIn("--no-deps", testpypi_command)
         self.assertIn("--only-binary=:all:", testpypi_command)
         self.assertIn("--index-url https://test.pypi.org/simple/", testpypi_command)
@@ -439,6 +474,30 @@ class BuildSiteTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(SiteBuildError, "one exact"):
+            build_details(
+                manifest_root=self._single_manifest_root(manifest),
+                generated_at=GENERATED_AT,
+                client=_FakeMetadataClient(responses),
+            )
+
+    def test_testpypi_recipe_rejects_active_direct_url_dependencies(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                distribution,
+                requires_dist=[
+                    "sdk @ https://example.invalid/sdk.whl ; extra != 'docs'"
+                ],
+            ),
+        }
+
+        with self.assertRaisesRegex(SiteBuildError, "unsupported direct URL"):
             build_details(
                 manifest_root=self._single_manifest_root(manifest),
                 generated_at=GENERATED_AT,

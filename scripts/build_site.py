@@ -11,13 +11,21 @@ import shutil
 import sys
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
+from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn, Protocol
 from urllib.parse import quote, urlsplit
 
 import httpx
-from dep_logic.markers import from_pkg_marker
+from dep_logic.markers import (
+    AnyMarker,
+    BaseMarker,
+    EmptyMarker,
+    MarkerUnion,
+    MultiMarker,
+    from_pkg_marker,
+)
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from packaging.markers import Marker
 from packaging.requirements import InvalidRequirement, Requirement
@@ -433,24 +441,45 @@ def _is_vane_distribution(distribution_name: str) -> bool:
     return normalized == "vane-ai" or normalized.startswith("vane-extension-")
 
 
-def _does_not_apply_without_extra(requirement: Requirement) -> bool:
-    """Return whether a requirement is impossible without selecting an extra."""
+def _marker_for_base_install(marker: BaseMarker) -> BaseMarker:
+    """Substitute an empty selected extra while preserving other conditions."""
+    if marker.is_any() or marker.is_empty():
+        return marker
+    if isinstance(marker, MultiMarker):
+        return MultiMarker.of(*(_marker_for_base_install(item) for item in marker))
+    if isinstance(marker, MarkerUnion):
+        return MarkerUnion.of(*(_marker_for_base_install(item) for item in marker))
+    if marker.only("extra") != marker:
+        return marker
+    if Marker(str(marker)).evaluate(
+        environment={"extra": ""}, context="metadata"
+    ):
+        return AnyMarker()
+    return EmptyMarker()
+
+
+def _requirement_for_base_install(requirement: Requirement) -> Requirement | None:
+    """Apply the empty-extra context without evaluating platform conditions."""
     if requirement.marker is None:
-        return False
+        return requirement
     try:
-        extra_marker = from_pkg_marker(requirement.marker).only("extra")
-        if extra_marker.is_any():
-            return False
-        if extra_marker.is_empty():
-            return True
-        applies = Marker(str(extra_marker)).evaluate(
-            environment={"extra": ""}, context="metadata"
-        )
+        marker = from_pkg_marker(requirement.marker)
+        base_marker = _marker_for_base_install(marker)
+        if base_marker.is_empty():
+            return None
+        if base_marker.is_any():
+            base_requirement = copy(requirement)
+            base_requirement.marker = None
+            return base_requirement
+        if base_marker == marker:
+            return requirement
+        base_requirement = copy(requirement)
+        base_requirement.marker = Marker(str(base_marker))
+        return base_requirement
     except (KeyError, TypeError, ValueError) as exception:
         raise SiteBuildError(
             f"package marker cannot be evaluated for {requirement}"
         ) from exception
-    return not applies
 
 
 def _exact_internal_requirement(
@@ -543,7 +572,9 @@ def _testpypi_install_commands(
     pending = list(requirements)
     public_requirements: set[str] = set()
     while pending:
-        requirement = pending.pop()
+        requirement = _requirement_for_base_install(pending.pop())
+        if requirement is None:
+            continue
         normalized_name = canonicalize_name(requirement.name)
         if not _is_vane_distribution(normalized_name):
             if requirement.url is not None:
@@ -554,9 +585,6 @@ def _testpypi_install_commands(
             if len(public_requirements) > PACKAGE_REQUIREMENTS_MAX_COUNT:
                 _fail(f"public dependency closure is too large for {distribution_name}")
             continue
-        if _does_not_apply_without_extra(requirement):
-            continue
-
         dependency_name, _requested_version = _exact_internal_requirement(
             requirement, distribution_name
         )
