@@ -8,16 +8,20 @@ import os
 import re
 import shlex
 import shutil
+import subprocess
 import sys
+import tempfile
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from typing import NoReturn, Protocol
 from urllib.parse import quote, urlsplit
 
 import httpx
+import tomli_w
 from dep_logic.markers import (
     AnyMarker,
     BaseMarker,
@@ -52,6 +56,9 @@ REMOTE_METADATA_TIMEOUT_SECONDS = 15.0
 METADATA_MAX_WORKERS = 16
 PACKAGE_REQUIREMENTS_MAX_COUNT = 256
 VANE_REQUIREMENTS_MAX_COUNT = 64
+PUBLIC_LOCK_MAX_BYTES = 64 * 1024
+PUBLIC_LOCK_MAX_COUNT = 512
+PUBLIC_LOCK_TIMEOUT_SECONDS = 120.0
 _PYTHON_TAG_RE = re.compile(r"^(?:cp|pp)([0-9])([0-9]+)$")
 _UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
@@ -104,6 +111,18 @@ class JsonMetadataClient(Protocol):
         headers: Mapping[str, str] | None = None,
         allow_not_found: bool = False,
     ) -> object | None: ...
+
+
+class PublicDependencyResolver(Protocol):
+    """Resolve public requirements without consulting a Vane package index."""
+
+    def resolve(
+        self,
+        requirements: tuple[str, ...],
+        *,
+        requires_python: str,
+        distribution_name: str,
+    ) -> tuple[str, ...]: ...
 
 
 class MetadataClient:
@@ -495,6 +514,181 @@ def _requirement_for_base_install(requirement: Requirement) -> Requirement | Non
         ) from exception
 
 
+def _parse_public_lock(
+    contents: bytes, *, distribution_name: str
+) -> tuple[str, ...]:
+    if len(contents) > PUBLIC_LOCK_MAX_BYTES:
+        _fail(f"public dependency lock is too large for {distribution_name}")
+    try:
+        lines = contents.decode("utf-8").splitlines()
+    except UnicodeError as exception:
+        raise SiteBuildError(
+            f"public dependency lock is invalid for {distribution_name}"
+        ) from exception
+
+    locked_requirements: set[str] = set()
+    for line in lines:
+        requirement_text = line.strip()
+        if not requirement_text:
+            continue
+        try:
+            requirement = Requirement(requirement_text)
+        except InvalidRequirement as exception:
+            raise SiteBuildError(
+                f"public dependency lock is invalid for {distribution_name}"
+            ) from exception
+        normalized_name = canonicalize_name(requirement.name)
+        specifiers = list(requirement.specifier)
+        if (
+            requirement.url is not None
+            or requirement.extras
+            or len(specifiers) != 1
+            or specifiers[0].operator not in {"==", "==="}
+            or "*" in specifiers[0].version
+        ):
+            _fail(f"public dependency lock is invalid for {distribution_name}")
+        try:
+            locked_version = str(Version(specifiers[0].version))
+        except InvalidVersion as exception:
+            raise SiteBuildError(
+                f"public dependency lock is invalid for {distribution_name}"
+            ) from exception
+        if _is_vane_distribution(normalized_name):
+            _fail(
+                f"public dependency closure for {distribution_name} contains "
+                f"Vane-owned package {normalized_name}"
+            )
+        if _requirement_for_base_install(requirement) is not requirement:
+            _fail(
+                f"public dependency lock contains an unresolved extra marker "
+                f"for {distribution_name}"
+            )
+        locked_requirement = f"{normalized_name}=={locked_version}"
+        if requirement.marker is not None:
+            locked_requirement = f"{locked_requirement}; {requirement.marker}"
+        locked_requirements.add(locked_requirement)
+        if len(locked_requirements) > PUBLIC_LOCK_MAX_COUNT:
+            _fail(f"public dependency lock is too large for {distribution_name}")
+    return tuple(sorted(locked_requirements, key=str.casefold))
+
+
+def _resolver_environment() -> dict[str, str]:
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith(("PIP_", "UV_"))
+    }
+
+
+class UvPublicDependencyResolver:
+    """Build one universal, exact public dependency closure with uv."""
+
+    def __init__(self) -> None:
+        self._cache: dict[tuple[str, tuple[str, ...]], tuple[str, ...]] = {}
+        self._lock = Lock()
+
+    def resolve(
+        self,
+        requirements: tuple[str, ...],
+        *,
+        requires_python: str,
+        distribution_name: str,
+    ) -> tuple[str, ...]:
+        normalized_requirements = tuple(sorted(set(requirements), key=str.casefold))
+        if not normalized_requirements:
+            return ()
+        cache_key = (requires_python, normalized_requirements)
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
+            resolved = self._resolve_uncached(
+                normalized_requirements,
+                requires_python=requires_python,
+                distribution_name=distribution_name,
+            )
+            self._cache[cache_key] = resolved
+            return resolved
+
+    def _resolve_uncached(
+        self,
+        requirements: tuple[str, ...],
+        *,
+        requires_python: str,
+        distribution_name: str,
+    ) -> tuple[str, ...]:
+        try:
+            with tempfile.TemporaryDirectory(prefix="vane-public-lock-") as temporary:
+                temporary_root = Path(temporary)
+                project_path = temporary_root / "pyproject.toml"
+                output_path = temporary_root / "requirements.txt"
+                project_path.write_text(
+                    tomli_w.dumps(
+                        {
+                            "project": {
+                                "name": "vane-registry-public-resolution-input",
+                                "version": "0",
+                                "requires-python": requires_python,
+                                "dependencies": list(requirements),
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "uv",
+                        "--quiet",
+                        "--no-progress",
+                        "--no-cache",
+                        "pip",
+                        "compile",
+                        str(project_path),
+                        "--universal",
+                        "--no-header",
+                        "--no-annotate",
+                        "--no-strip-markers",
+                        "--default-index",
+                        _PACKAGE_INDEXES["pypi"]["simple"],
+                        "--no-config",
+                        "--no-sources",
+                        "--no-python-downloads",
+                        "--keyring-provider",
+                        "disabled",
+                        "--only-binary=:all:",
+                        "--output-file",
+                        str(output_path),
+                    ],
+                    cwd=temporary_root,
+                    env=_resolver_environment(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=PUBLIC_LOCK_TIMEOUT_SECONDS,
+                    check=False,
+                )
+                if result.returncode != 0:
+                    _fail(
+                        "could not resolve public dependency closure for "
+                        f"{distribution_name}"
+                    )
+                with output_path.open("rb") as output_file:
+                    contents = output_file.read(PUBLIC_LOCK_MAX_BYTES + 1)
+        except SiteBuildError:
+            raise
+        except (OSError, subprocess.SubprocessError) as exception:
+            raise SiteBuildError(
+                "could not resolve public dependency closure for "
+                f"{distribution_name}"
+            ) from exception
+        return _parse_public_lock(contents, distribution_name=distribution_name)
+
+
+_PUBLIC_DEPENDENCY_RESOLVER = UvPublicDependencyResolver()
+
+
 def _exact_internal_requirement(
     requirement: Requirement, parent_distribution: str
 ) -> tuple[str, str]:
@@ -577,8 +771,10 @@ def _shell_command(arguments: list[str]) -> str:
 def _testpypi_install_commands(
     distribution_name: str,
     version_text: str,
+    requires_python: object,
     requirements: tuple[Requirement, ...],
     client: JsonMetadataClient,
+    public_resolver: PublicDependencyResolver,
 ) -> list[str]:
     root_name = canonicalize_name(distribution_name)
     selected_versions: dict[str, str] = {root_name: version_text}
@@ -621,17 +817,31 @@ def _testpypi_install_commands(
 
     commands: list[str] = []
     if public_requirements:
-        commands.append(
-            _shell_command(
-                [
-                    *_ISOLATED_PIP_COMMAND,
-                    "install",
-                    "--index-url",
-                    _PACKAGE_INDEXES["pypi"]["simple"],
-                    *sorted(public_requirements, key=str.casefold),
-                ]
+        if not isinstance(requires_python, str):
+            _fail(
+                f"{distribution_name} must declare Requires-Python to resolve "
+                "public dependencies"
             )
+        public_lock = public_resolver.resolve(
+            tuple(sorted(public_requirements, key=str.casefold)),
+            requires_python=requires_python,
+            distribution_name=distribution_name,
         )
+        if public_lock:
+            commands.append(
+                _shell_command(
+                    [
+                        *_ISOLATED_PIP_COMMAND,
+                        "install",
+                        "--force-reinstall",
+                        "--no-deps",
+                        "--only-binary=:all:",
+                        "--index-url",
+                        _PACKAGE_INDEXES["pypi"]["simple"],
+                        *public_lock,
+                    ]
+                )
+            )
     commands.append(
         _shell_command(
             [
@@ -661,6 +871,7 @@ def _installation_metadata(
     package: Mapping[str, object],
     requirements: tuple[Requirement, ...],
     client: JsonMetadataClient,
+    public_resolver: PublicDependencyResolver,
 ) -> dict[str, object]:
     version_text = package["latest_version"]
     if not package["published"]:
@@ -671,7 +882,12 @@ def _installation_metadata(
         if package["wheel_count"] == 0:
             _fail(f"{distribution_name} does not publish a non-yanked wheel")
         install_commands = _testpypi_install_commands(
-            distribution_name, version_text, requirements, client
+            distribution_name,
+            version_text,
+            package["requires_python"],
+            requirements,
+            client,
+            public_resolver,
         )
     else:
         install_commands = [
@@ -679,6 +895,8 @@ def _installation_metadata(
                 [
                     *_ISOLATED_PIP_COMMAND,
                     "install",
+                    "--force-reinstall",
+                    "--only-binary=:all:",
                     "--index-url",
                     _PACKAGE_INDEXES["pypi"]["simple"],
                     f"{distribution_name}==={version_text}",
@@ -701,6 +919,7 @@ def _detail_record(
     generated_at: str,
     client: JsonMetadataClient,
     github_token: str | None,
+    public_resolver: PublicDependencyResolver,
 ) -> dict[str, object]:
     extension_name = str(manifest["extension_name"])
     distribution_name = str(manifest["distribution_name"])
@@ -733,6 +952,7 @@ def _detail_record(
             package,
             requirements,
             client,
+            public_resolver,
         ),
         "metrics": metrics,
     }
@@ -744,6 +964,7 @@ def build_details(
     generated_at: str,
     client: JsonMetadataClient,
     github_token: str | None = None,
+    public_resolver: PublicDependencyResolver = _PUBLIC_DEPENDENCY_RESOLVER,
 ) -> tuple[dict[str, object], ...]:
     """Return enriched detail records for every reviewed manifest."""
     _timestamp(generated_at, "generated_at")
@@ -761,6 +982,7 @@ def build_details(
                     generated_at=generated_at,
                     client=client,
                     github_token=github_token,
+                    public_resolver=public_resolver,
                 ),
                 manifests,
             )

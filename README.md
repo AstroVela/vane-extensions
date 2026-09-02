@@ -60,17 +60,20 @@ For TestPyPI packages, the generated installation recipe keeps indexes
 isolated. Every command sets `PIP_CONFIG_FILE=/dev/null` so pip skips global,
 site, user, and explicit configuration files, then passes pip's `--isolated`
 global option to ignore the remaining environment variables. The recipe first
-installs ordinary dependencies from PyPI, then installs the exact Vane and
-extension wheels from TestPyPI with dependency resolution disabled and forced
-reinstallation so a matching distribution already present from PyPI cannot
-satisfy the TestPyPI step. The site build fails closed unless the provider and
-every selected Vane-owned dependency publish at least one non-yanked wheel. The
-registry never emits `--extra-index-url`, because pip gives no priority to the
-primary index and that pattern is vulnerable to dependency confusion.
-PEP 508 requirements and wheel filenames are parsed by `packaging`; `dep-logic`
-reduces compound extra markers without tying recipes to the build machine.
-Direct-URL requirements are omitted from published JSON and HTML so artifact
-locations or embedded credentials cannot leak through package metadata.
+uses `uv` to resolve the complete public dependency closure across the
+provider's supported Python versions. It then installs that exact, wheel-only
+closure from PyPI with dependency resolution disabled before installing the
+exact Vane and extension wheels from TestPyPI the same way. Both steps force
+reinstallation so a matching distribution already present from another source
+cannot satisfy either step. The site build fails closed unless the provider and
+every selected Vane-owned dependency publish at least one non-yanked wheel, or
+if the public closure contains a Vane-owned package. The registry never emits
+`--extra-index-url`, because pip gives no priority to the primary index and that
+pattern is vulnerable to dependency confusion. PEP 508 requirements and wheel
+filenames are parsed by `packaging`; `dep-logic` reduces compound extra markers
+without tying recipes to the build machine. Direct-URL requirements are omitted
+from published JSON and HTML so artifact locations or embedded credentials
+cannot leak through package metadata.
 
 `index.json` is generated deterministically from the discovery subset of the
 individual manifests and must be updated in the same pull request. Package

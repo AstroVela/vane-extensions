@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from collections.abc import Mapping
@@ -14,7 +16,9 @@ from scripts.build_catalog import DEFAULT_MANIFEST_ROOT, PROJECT_ROOT, load_mani
 from scripts.build_site import (
     MetadataClient,
     SiteBuildError,
+    UvPublicDependencyResolver,
     _detail_html,
+    _parse_public_lock,
     _requirement_for_base_install,
     assemble_site,
     build_details,
@@ -42,6 +46,22 @@ class _FakeMetadataClient:
         if value is None and not allow_not_found:
             raise AssertionError(f"unexpected missing metadata: {url}")
         return value
+
+
+class _FakePublicDependencyResolver:
+    def __init__(self, resolved: tuple[str, ...]) -> None:
+        self.resolved = resolved
+        self.calls: list[tuple[tuple[str, ...], str, str]] = []
+
+    def resolve(
+        self,
+        requirements: tuple[str, ...],
+        *,
+        requires_python: str,
+        distribution_name: str,
+    ) -> tuple[str, ...]:
+        self.calls.append((requirements, requires_python, distribution_name))
+        return self.resolved
 
 
 class MetadataClientTests(unittest.TestCase):
@@ -80,6 +100,89 @@ class MetadataClientTests(unittest.TestCase):
         with MetadataClient(transport=transport) as client:
             with self.assertRaisesRegex(SiteBuildError, "repeats key"):
                 client.get_json("https://example.com/data")
+
+
+class PublicDependencyResolverTests(unittest.TestCase):
+    def test_lock_parser_accepts_only_exact_public_requirements(self) -> None:
+        self.assertEqual(
+            _parse_public_lock(b"", distribution_name="vane-extension-test"), ()
+        )
+        self.assertEqual(
+            _parse_public_lock(
+                (
+                    "Foo_Bar===1.0\n"
+                    'conditional==2.0; python_version < "3.12"\n'
+                ).encode(),
+                distribution_name="vane-extension-test",
+            ),
+            (
+                'conditional==2.0; python_version < "3.12"',
+                "foo-bar==1.0",
+            ),
+        )
+
+    def test_lock_parser_rejects_unsafe_resolutions(self) -> None:
+        cases = {
+            "range": b"public-package>=1\n",
+            "extra": b"public-package[feature]==1\n",
+            "direct URL": b"public-package @ https://example.invalid/a.whl\n",
+            "extra marker": b'public-package==1; extra == "feature"\n',
+            "transitive Vane package": b"vane-ai==0.2.0\n",
+        }
+        for case, contents in cases.items():
+            with self.subTest(case=case), self.assertRaises(SiteBuildError):
+                _parse_public_lock(
+                    contents, distribution_name="vane-extension-test"
+                )
+
+    def test_uv_resolution_is_config_free_bounded_and_cached(self) -> None:
+        resolver = UvPublicDependencyResolver()
+
+        def run(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            output_path = Path(arguments[arguments.index("--output-file") + 1])
+            output_path.write_bytes(b"public-package==1.2.3\n")
+            environment = kwargs["env"]
+            self.assertIsInstance(environment, dict)
+            assert isinstance(environment, dict)
+            self.assertFalse(
+                any(
+                    key.upper().startswith(("PIP_", "UV_"))
+                    for key in environment
+                )
+            )
+            self.assertEqual(environment["HTTPS_PROXY"], "https://proxy.invalid")
+            self.assertIn("--universal", arguments)
+            self.assertIn("--no-config", arguments)
+            self.assertIn("--no-cache", arguments)
+            self.assertIn("--only-binary=:all:", arguments)
+            self.assertEqual(kwargs["stderr"], subprocess.DEVNULL)
+            return subprocess.CompletedProcess(arguments, 0)
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "PIP_INDEX_URL": "https://untrusted.invalid/simple",
+                    "UV_INDEX": "https://untrusted.invalid/simple",
+                    "HTTPS_PROXY": "https://proxy.invalid",
+                },
+            ),
+            patch("scripts.build_site.subprocess.run", side_effect=run) as run_mock,
+        ):
+            first = resolver.resolve(
+                ("public-package>=1",),
+                requires_python=">=3.10,<3.15",
+                distribution_name="vane-extension-test",
+            )
+            second = resolver.resolve(
+                ("public-package>=1",),
+                requires_python=">=3.10,<3.15",
+                distribution_name="vane-extension-other",
+            )
+
+        self.assertEqual(first, ("public-package==1.2.3",))
+        self.assertEqual(second, first)
+        self.assertEqual(run_mock.call_count, 1)
 
 
 def _github_response(repository: str, stars: int = 7) -> dict[str, object]:
@@ -363,6 +466,7 @@ class BuildSiteTests(unittest.TestCase):
             [
                 "env PIP_CONFIG_FILE=/dev/null "
                 "python -m pip --isolated install "
+                "--force-reinstall --only-binary=:all: "
                 "--index-url https://pypi.org/simple/ "
                 f"{distribution}===0.2.0"
             ],
@@ -422,11 +526,21 @@ class BuildSiteTests(unittest.TestCase):
                 )
             ),
         }
+        public_resolver = _FakePublicDependencyResolver(
+            (
+                "default-extra==1.0",
+                "numpy==2.5.2",
+                'platform-marker==1.0; sys_platform == "extra"',
+                "transitive-public==2.0",
+                "typing-extensions==4.16.0",
+            )
+        )
 
         detail = build_details(
             manifest_root=self._single_manifest_root(manifest),
             generated_at=GENERATED_AT,
             client=_FakeMetadataClient(responses),
+            public_resolver=public_resolver,
         )[0]
 
         public_command, testpypi_command = detail["installation"][
@@ -443,20 +557,39 @@ class BuildSiteTests(unittest.TestCase):
                 ),
             ],
         )
+        self.assertEqual(
+            public_resolver.calls,
+            [
+                (
+                    (
+                        "default-extra",
+                        "numpy>=2",
+                        'platform-marker; sys_platform == "extra"',
+                        "typing-extensions",
+                    ),
+                    ">=3.10,<3.15",
+                    distribution,
+                )
+            ],
+        )
         self.assertIn("--index-url https://pypi.org/simple/", public_command)
         isolated_pip = (
             "env PIP_CONFIG_FILE=/dev/null python -m pip --isolated install"
         )
         self.assertTrue(public_command.startswith(isolated_pip))
-        self.assertIn("'numpy>=2'", public_command)
-        self.assertIn("typing-extensions", public_command)
-        self.assertIn("platform-marker", public_command)
-        self.assertIn("default-extra", public_command)
+        self.assertIn("numpy==2.5.2", public_command)
+        self.assertIn("typing-extensions==4.16.0", public_command)
+        self.assertIn("platform-marker==1.0", public_command)
+        self.assertIn("default-extra==1.0", public_command)
+        self.assertIn("transitive-public==2.0", public_command)
+        self.assertNotIn("numpy>=2", public_command)
         self.assertNotIn("test.pypi.org", public_command)
         self.assertNotIn("vane-", public_command)
         self.assertNotIn("optional-sdk", public_command)
         self.assertNotIn("optional-url", public_command)
-        self.assertNotIn("--force-reinstall", public_command)
+        self.assertIn("--force-reinstall", public_command)
+        self.assertIn("--no-deps", public_command)
+        self.assertIn("--only-binary=:all:", public_command)
         self.assertIn("--force-reinstall", testpypi_command)
         self.assertTrue(testpypi_command.startswith(isolated_pip))
         self.assertIn("--no-deps", testpypi_command)
@@ -471,6 +604,60 @@ class BuildSiteTests(unittest.TestCase):
             "--extra-index-url", "\n".join(detail["installation"]["install_commands"])
         )
         self.assertNotIn("example.invalid", json.dumps(detail))
+
+    def test_empty_public_resolution_omits_the_public_install_step(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                distribution,
+                requires_dist=['legacy-package; python_version < "3"'],
+            ),
+        }
+        public_resolver = _FakePublicDependencyResolver(())
+
+        detail = build_details(
+            manifest_root=self._single_manifest_root(manifest),
+            generated_at=GENERATED_AT,
+            client=_FakeMetadataClient(responses),
+            public_resolver=public_resolver,
+        )[0]
+
+        self.assertEqual(len(detail["installation"]["install_commands"]), 1)
+        self.assertEqual(
+            public_resolver.calls[0][0],
+            ('legacy-package; python_version < "3"',),
+        )
+
+    def test_public_resolution_requires_a_python_range(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        package = _package_response(distribution, requires_dist=["numpy"])
+        assert isinstance(package["info"], dict)
+        package["info"]["requires_python"] = None
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": package,
+        }
+        public_resolver = _FakePublicDependencyResolver(("numpy==2.5.2",))
+
+        with self.assertRaisesRegex(SiteBuildError, "declare Requires-Python"):
+            build_details(
+                manifest_root=self._single_manifest_root(manifest),
+                generated_at=GENERATED_AT,
+                client=_FakeMetadataClient(responses),
+                public_resolver=public_resolver,
+            )
+        self.assertEqual(public_resolver.calls, [])
 
     def test_testpypi_vane_dependencies_must_use_exact_versions(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
