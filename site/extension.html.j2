@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="{{ detail.description }}">
+    <title>{{ detail.extension_name }} · Vane extensions</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        line-height: 1.5;
+      }
+      body { margin: 0 auto; max-width: 64rem; padding: 2.5rem 1.25rem; }
+      nav, .meta { opacity: 0.78; }
+      h1 { font-size: clamp(2rem, 7vw, 4rem); letter-spacing: -0.04em; margin-bottom: 0; }
+      dl { display: grid; grid-template-columns: max-content 1fr; gap: 0.5rem 1rem; }
+      dt { font-weight: 700; }
+      dd { margin: 0; overflow-wrap: anywhere; }
+      pre {
+        background: color-mix(in srgb, currentColor 8%, transparent);
+        border-radius: 0.6rem;
+        overflow-x: auto;
+        padding: 1rem;
+      }
+      .description { font-size: 1.15rem; }
+      .extended { white-space: pre-line; }
+    </style>
+  </head>
+  <body>
+    <nav><a href="../../">Vane extensions</a> · <a href="{{ machine_url }}">JSON</a></nav>
+    <main>
+      <h1>{{ detail.extension_name }}</h1>
+      <p class="description">{{ detail.description }}</p>
+      <dl>
+        <dt>Package</dt>
+        <dd><a href="{{ package.project_url }}">{{ detail.distribution_name }}</a></dd>
+        <dt>Latest version</dt><dd>{{ latest_version }}</dd>
+        <dt>Latest release upload</dt>
+        <dd>{{ package.latest_release_uploaded_at or "Unknown" }}</dd>
+        <dt>Package index</dt><dd>{{ package.index }}</dd>
+        <dt>Requires Python</dt><dd>{{ package.requires_python or "Unknown" }}</dd>
+        <dt>Package requirements</dt>
+        <dd>{{ package.requires_dist | join(", ") or "None" }}</dd>
+        <dt>Python wheels</dt><dd>{{ package.wheel_count }} · {{ python_versions }}</dd>
+        <dt>Wheel Python tags</dt><dd>{{ package.python_tags | join(", ") or "None" }}</dd>
+        <dt>Wheel ABI tags</dt><dd>{{ abi_tags }}</dd>
+        <dt>Wheel platforms</dt><dd>{{ platform_tags }}</dd>
+        <dt>GitHub stars</dt><dd>{{ source.github_stars }}</dd>
+        <dt>Downloads last week</dt><dd>{{ downloads }}</dd>
+        <dt>Maintainers</dt>
+        <dd>
+          {%- for maintainer in maintainers -%}
+            {%- if not loop.first %} · {% endif -%}
+            <a href="{{ maintainer.url }}">@{{ maintainer.name }}</a>
+          {%- endfor -%}
+        </dd>
+        <dt>Publisher</dt><dd>{{ detail.publisher }}</dd>
+        <dt>License</dt><dd>{{ detail.license }}</dd>
+        <dt>Source</dt><dd><a href="{{ detail.repository }}">{{ detail.repository }}</a></dd>
+        <dt>Documentation</dt><dd><a href="{{ documentation.url }}">Provider documentation</a></dd>
+      </dl>
+      <h2>Install</h2>
+      {% if installation.install_commands %}
+      <pre><code>{{ installation.install_commands | join("\n") }}</code></pre>
+      {% else %}
+      <p>No install command is available until this package is published.</p>
+      {% endif %}
+      <h2>Load</h2>
+      <pre><code>{{ installation.load_example }}</code></pre>
+      <h2>Hello world</h2>
+      <pre><code>{{ documentation.hello_world }}</code></pre>
+      <h2>About</h2>
+      <p class="extended">{{ documentation.extended_description }}</p>
+    </main>
+  </body>
+</html>

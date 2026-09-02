@@ -5,6 +5,8 @@ on:
     branches:
       - main
   workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * *"
 
 permissions:
   contents: read
@@ -21,25 +23,33 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Install schema validator
-        run: python -m pip install check-jsonschema==0.38.0
+      - name: Install registry tooling
+        run: python -m pip install -r requirements.txt
       - name: Validate and test the registry
         run: |
           check-jsonschema --schemafile schema/extension.schema.json extensions/*/extension.json
           python -m scripts.build_catalog --check index.json
           python -m unittest discover -s tests -v
       - name: Assemble the site
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m scripts.build_site --output _site
+      - name: Validate generated service documents
         run: |
-          mkdir -p _site/v1 _site/schema
-          cp site/index.html _site/index.html
-          cp index.json _site/v1/index.json
-          cp schema/extension.schema.json _site/schema/extension.schema.json
-          touch _site/.nojekyll
+          check-jsonschema --schemafile schema/extension-details-index.schema.json \
+            _site/v1/extensions/index.json
+          find _site/v1/extensions -maxdepth 1 -type f -name '*.json' \
+            ! -name 'index.json' -print0 \
+            | xargs -0 check-jsonschema \
+                --schemafile schema/extension-detail.schema.json
+          check-jsonschema --schemafile schema/download-metrics.schema.json \
+            _site/v1/metrics/downloads-last-week.json
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:

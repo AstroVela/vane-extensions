@@ -12,16 +12,31 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Install schema validator
-        run: python -m pip install check-jsonschema==0.38.0
+      - name: Install registry tooling
+        run: python -m pip install -r requirements.txt
       - name: Validate manifests against the schema
         run: check-jsonschema --schemafile schema/extension.schema.json extensions/*/extension.json
       - name: Verify the generated catalog
         run: python -m scripts.build_catalog --check index.json
       - name: Run registry tests
         run: python -m unittest discover -s tests -v
+      - name: Assemble the site with live metadata
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python -m scripts.build_site --output _site
+      - name: Validate generated service documents
+        run: |
+          check-jsonschema --schemafile schema/extension-details-index.schema.json \
+            _site/v1/extensions/index.json
+          find _site/v1/extensions -maxdepth 1 -type f -name '*.json' \
+            ! -name 'index.json' -print0 \
+            | xargs -0 check-jsonschema \
+                --schemafile schema/extension-detail.schema.json
+          check-jsonschema --schemafile schema/download-metrics.schema.json \
+            _site/v1/metrics/downloads-last-week.json

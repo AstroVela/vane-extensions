@@ -1,0 +1,237 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrovela.github.io/vane-extensions/schema/extension-details-index.schema.json",
+  "title": "Vane extension detail index",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "format_version",
+    "generated_at",
+    "extensions"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../../schema/extension-details-index.schema.json"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "extensions": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "extension_name",
+          "distribution_name",
+          "description",
+          "repository",
+          "publisher",
+          "license",
+          "source",
+          "package",
+          "installation"
+        ],
+        "properties": {
+          "extension_name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+          },
+          "distribution_name": {
+            "type": "string",
+            "pattern": "^vane-extension-[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 500
+          },
+          "repository": {
+            "type": "string",
+            "format": "uri",
+            "pattern": "^https://github\\.com/"
+          },
+          "publisher": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100
+          },
+          "license": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 200
+          },
+          "source": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "github_stars"
+            ],
+            "properties": {
+              "github_stars": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "package": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "index",
+              "published",
+              "latest_version",
+              "wheel_count",
+              "python_versions",
+              "python_tags"
+            ],
+            "properties": {
+              "index": {
+                "enum": [
+                  "pypi",
+                  "testpypi"
+                ]
+              },
+              "published": {
+                "type": "boolean"
+              },
+              "latest_version": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 4096
+              },
+              "wheel_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "python_versions": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[0-9]+\\.[0-9]+$"
+                }
+              },
+              "python_tags": {
+                "type": "array",
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9_.]+$"
+                }
+              }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": {
+                    "published": {
+                      "const": false
+                    }
+                  },
+                  "required": [
+                    "published"
+                  ]
+                },
+                "then": {
+                  "properties": {
+                    "latest_version": {
+                      "type": "null"
+                    },
+                    "wheel_count": {
+                      "const": 0
+                    },
+                    "python_versions": {
+                      "maxItems": 0
+                    },
+                    "python_tags": {
+                      "maxItems": 0
+                    }
+                  }
+                },
+                "else": {
+                  "properties": {
+                    "latest_version": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                }
+              }
+            ]
+          },
+          "installation": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "install_commands"
+            ],
+            "properties": {
+              "install_commands": {
+                "type": "array",
+                "maxItems": 2,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4096
+                }
+              }
+            }
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "package": {
+                  "properties": {
+                    "published": {
+                      "const": false
+                    }
+                  },
+                  "required": [
+                    "published"
+                  ]
+                }
+              },
+              "required": [
+                "package"
+              ]
+            },
+            "then": {
+              "properties": {
+                "installation": {
+                  "properties": {
+                    "install_commands": {
+                      "maxItems": 0
+                    }
+                  }
+                }
+              }
+            },
+            "else": {
+              "properties": {
+                "installation": {
+                  "properties": {
+                    "install_commands": {
+                      "minItems": 1
+                    }
+                  }
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

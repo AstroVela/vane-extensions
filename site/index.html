@@ -39,13 +39,27 @@
         padding: 1.25rem;
       }
       article h2 {
-        margin-top: 0;
+        margin: 0;
       }
       code {
         overflow-wrap: anywhere;
       }
+      .install {
+        white-space: pre-wrap;
+      }
+      .title-row {
+        align-items: baseline;
+        display: flex;
+        gap: 0.75rem;
+        justify-content: space-between;
+      }
       .meta {
         opacity: 0.75;
+      }
+      .facts {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.35rem 1rem;
       }
     </style>
   </head>
@@ -57,7 +71,9 @@
         package with pip, then load its provider explicitly from Vane.
       </p>
       <p>
-        <a href="v1/index.json">Machine-readable catalog</a> ·
+        <a href="v1/index.json">Discovery catalog</a> ·
+        <a href="v1/extensions/index.json">Extension details</a> ·
+        <a href="v1/metrics/downloads-last-week.json">Download metrics</a> ·
         <a href="https://github.com/AstroVela/vane-extensions">Contribute an extension</a>
       </p>
     </header>
@@ -69,7 +85,7 @@
       const status = document.querySelector("#status");
       const extensions = document.querySelector("#extensions");
 
-      fetch("v1/index.json", { cache: "no-cache" })
+      fetch("v1/extensions/index.json", { cache: "no-cache" })
         .then((response) => {
           if (!response.ok) throw new Error(`HTTP ${response.status}`);
           return response.json();
@@ -78,20 +94,44 @@
           status.textContent = `${catalog.extensions.length} extensions`;
           for (const entry of catalog.extensions) {
             const card = document.createElement("article");
+            const titleRow = document.createElement("div");
             const heading = document.createElement("h2");
+            const details = document.createElement("a");
             const description = document.createElement("p");
             const command = document.createElement("code");
+            const facts = document.createElement("p");
             const metadata = document.createElement("p");
             const repository = document.createElement("a");
 
+            titleRow.className = "title-row";
             heading.textContent = entry.extension_name;
+            details.href = `extensions/${entry.extension_name}/`;
+            details.textContent = "Details";
             description.textContent = entry.description;
-            command.textContent = `pip install ${entry.distribution_name}`;
+            command.className = "install";
+            command.textContent = entry.installation.install_commands.length
+              ? entry.installation.install_commands.join("\n")
+              : "No install command is available until this package is published.";
+            facts.className = "facts meta";
+            const version = document.createElement("span");
+            const stars = document.createElement("span");
+            const python = document.createElement("span");
+            version.textContent = entry.package.published
+              ? `Version ${entry.package.latest_version}`
+              : `Not published on ${entry.package.index}`;
+            stars.textContent = `${entry.source.github_stars} GitHub stars`;
+            python.textContent = entry.package.python_versions.length
+              ? `Python ${entry.package.python_versions.join(", ")}`
+              : entry.package.wheel_count
+                ? `Wheel tags ${entry.package.python_tags.join(", ")}`
+                : "No wheels published";
+            facts.append(version, stars, python);
             metadata.className = "meta";
             repository.href = entry.repository;
             repository.textContent = `${entry.publisher} · ${entry.license}`;
             metadata.append(repository);
-            card.append(heading, description, command, metadata);
+            titleRow.append(heading, details);
+            card.append(titleRow, description, command, facts, metadata);
             extensions.append(card);
           }
         })
