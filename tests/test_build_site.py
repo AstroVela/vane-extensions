@@ -361,6 +361,7 @@ class BuildSiteTests(unittest.TestCase):
         self.assertEqual(
             detail["installation"]["install_commands"],
             [
+                "env PIP_CONFIG_FILE=/dev/null "
                 "python -m pip --isolated install "
                 "--index-url https://pypi.org/simple/ "
                 f"{distribution}===0.2.0"
@@ -443,7 +444,10 @@ class BuildSiteTests(unittest.TestCase):
             ],
         )
         self.assertIn("--index-url https://pypi.org/simple/", public_command)
-        self.assertIn("python -m pip --isolated install", public_command)
+        isolated_pip = (
+            "env PIP_CONFIG_FILE=/dev/null python -m pip --isolated install"
+        )
+        self.assertTrue(public_command.startswith(isolated_pip))
         self.assertIn("'numpy>=2'", public_command)
         self.assertIn("typing-extensions", public_command)
         self.assertIn("platform-marker", public_command)
@@ -454,7 +458,7 @@ class BuildSiteTests(unittest.TestCase):
         self.assertNotIn("optional-url", public_command)
         self.assertNotIn("--force-reinstall", public_command)
         self.assertIn("--force-reinstall", testpypi_command)
-        self.assertIn("python -m pip --isolated install", testpypi_command)
+        self.assertTrue(testpypi_command.startswith(isolated_pip))
         self.assertIn("--no-deps", testpypi_command)
         self.assertIn("--only-binary=:all:", testpypi_command)
         self.assertIn("--index-url https://test.pypi.org/simple/", testpypi_command)

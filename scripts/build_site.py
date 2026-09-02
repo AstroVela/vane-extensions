@@ -70,6 +70,14 @@ _PACKAGE_INDEXES = {
         "simple": "https://test.pypi.org/simple/",
     },
 }
+_ISOLATED_PIP_COMMAND = (
+    "env",
+    "PIP_CONFIG_FILE=/dev/null",
+    "python",
+    "-m",
+    "pip",
+    "--isolated",
+)
 _TEMPLATE_ENVIRONMENT = Environment(
     loader=FileSystemLoader(PROJECT_ROOT / "site"),
     autoescape=True,
@@ -616,10 +624,7 @@ def _testpypi_install_commands(
         commands.append(
             _shell_command(
                 [
-                    "python",
-                    "-m",
-                    "pip",
-                    "--isolated",
+                    *_ISOLATED_PIP_COMMAND,
                     "install",
                     "--index-url",
                     _PACKAGE_INDEXES["pypi"]["simple"],
@@ -630,10 +635,7 @@ def _testpypi_install_commands(
     commands.append(
         _shell_command(
             [
-                "python",
-                "-m",
-                "pip",
-                "--isolated",
+                *_ISOLATED_PIP_COMMAND,
                 "install",
                 "--force-reinstall",
                 "--no-deps",
@@ -675,10 +677,7 @@ def _installation_metadata(
         install_commands = [
             _shell_command(
                 [
-                    "python",
-                    "-m",
-                    "pip",
-                    "--isolated",
+                    *_ISOLATED_PIP_COMMAND,
                     "install",
                     "--index-url",
                     _PACKAGE_INDEXES["pypi"]["simple"],

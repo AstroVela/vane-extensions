@@ -57,10 +57,11 @@ loaded.
    ```
 
 For TestPyPI packages, the generated installation recipe keeps indexes
-isolated. Every command passes pip's `--isolated` global option to ignore
-environment variables and user configuration. The recipe first installs
-ordinary dependencies from PyPI, then installs the exact Vane and extension
-wheels from TestPyPI with dependency resolution disabled and forced
+isolated. Every command sets `PIP_CONFIG_FILE=/dev/null` so pip skips global,
+site, user, and explicit configuration files, then passes pip's `--isolated`
+global option to ignore the remaining environment variables. The recipe first
+installs ordinary dependencies from PyPI, then installs the exact Vane and
+extension wheels from TestPyPI with dependency resolution disabled and forced
 reinstallation so a matching distribution already present from PyPI cannot
 satisfy the TestPyPI step. The site build fails closed unless the provider and
 every selected Vane-owned dependency publish at least one non-yanked wheel. The
