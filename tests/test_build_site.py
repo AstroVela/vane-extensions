@@ -446,6 +446,8 @@ class BuildSiteTests(unittest.TestCase):
         self.assertNotIn("vane-", public_command)
         self.assertNotIn("optional-sdk", public_command)
         self.assertNotIn("optional-url", public_command)
+        self.assertNotIn("--force-reinstall", public_command)
+        self.assertIn("--force-reinstall", testpypi_command)
         self.assertIn("--no-deps", testpypi_command)
         self.assertIn("--only-binary=:all:", testpypi_command)
         self.assertIn("--index-url https://test.pypi.org/simple/", testpypi_command)

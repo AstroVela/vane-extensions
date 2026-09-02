@@ -59,10 +59,12 @@ loaded.
 For TestPyPI packages, the generated installation recipe keeps indexes
 isolated. It first installs ordinary dependencies from PyPI, then installs the
 exact Vane and extension wheels from TestPyPI with dependency resolution
-disabled. The site build fails closed unless the provider and every selected
-Vane-owned dependency publish at least one non-yanked wheel. The registry never
-emits `--extra-index-url`, because pip gives no priority to the primary index
-and that pattern is vulnerable to dependency confusion.
+disabled and forced reinstallation so a matching distribution already present
+from PyPI cannot satisfy the TestPyPI step. The site build fails closed unless
+the provider and every selected Vane-owned dependency publish at least one
+non-yanked wheel. The registry never emits `--extra-index-url`, because pip
+gives no priority to the primary index and that pattern is vulnerable to
+dependency confusion.
 PEP 508 requirements and wheel filenames are parsed by `packaging`; `dep-logic`
 reduces compound extra markers without tying recipes to the build machine.
 

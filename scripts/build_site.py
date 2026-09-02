@@ -628,6 +628,7 @@ def _testpypi_install_commands(
                 "-m",
                 "pip",
                 "install",
+                "--force-reinstall",
                 "--no-deps",
                 "--only-binary=:all:",
                 "--index-url",
