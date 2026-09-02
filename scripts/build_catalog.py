@@ -21,6 +21,8 @@ MANIFEST_MAX_COUNT = 1024
 SCHEMA_REFERENCE = "../../schema/extension.schema.json"
 EXTENSION_NAME_RE = re.compile(r"^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$")
 DISTRIBUTION_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+GITHUB_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
+GITHUB_REPOSITORY_RE = re.compile(r"^[A-Za-z0-9_.-]{1,100}$")
 MANIFEST_KEYS = frozenset(
     {
         "$schema",
@@ -30,8 +32,21 @@ MANIFEST_KEYS = frozenset(
         "repository",
         "publisher",
         "license",
+        "maintainers",
+        "package_index",
+        "documentation",
     }
 )
+DOCUMENTATION_KEYS = frozenset({"url", "hello_world", "extended_description"})
+CATALOG_KEYS = (
+    "extension_name",
+    "distribution_name",
+    "description",
+    "repository",
+    "publisher",
+    "license",
+)
+PACKAGE_INDEXES = frozenset({"pypi", "testpypi"})
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MANIFEST_ROOT = PROJECT_ROOT / "extensions"
 
@@ -85,10 +100,27 @@ def _manifest_string(value: object, field: str, *, max_length: int) -> str:
     return value
 
 
-def _validate_repository(value: object, field: str) -> str:
-    repository = _manifest_string(value, field, max_length=2048)
+def _manifest_multiline_string(
+    value: object, field: str, *, max_length: int
+) -> str:
+    if not isinstance(value, str) or not value or value != value.strip():
+        _fail(f"{field} must be a non-empty trimmed string")
+    if len(value) > max_length:
+        _fail(f"{field} exceeds its {max_length}-character limit")
+    if any(
+        (ord(character) < 32 and character != "\n") or ord(character) == 127
+        for character in value
+    ):
+        _fail(f"{field} must not contain control characters other than newlines")
+    if any(0xD800 <= ord(character) <= 0xDFFF for character in value):
+        _fail(f"{field} must not contain lone Unicode surrogates")
+    return value
+
+
+def _validate_https_url(value: object, field: str) -> str:
+    url = _manifest_string(value, field, max_length=2048)
     try:
-        parsed = urlsplit(repository)
+        parsed = urlsplit(url)
         port = parsed.port
     except ValueError as exception:
         raise CatalogBuildError(f"{field} is not a valid URL") from exception
@@ -98,17 +130,31 @@ def _validate_repository(value: object, field: str) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or port is not None
-        or not parsed.path.strip("/")
-        or parsed.query
-        or parsed.fragment
-        or not repository.isascii()
-        or any(character.isspace() for character in repository)
+        or not url.isascii()
+        or any(character.isspace() for character in url)
     ):
-        _fail(f"{field} must be a canonical HTTPS repository URL")
+        _fail(f"{field} must be a canonical HTTPS URL")
+    return url
+
+
+def _validate_github_repository(value: object) -> str:
+    repository = _validate_https_url(value, "repository")
+    parsed = urlsplit(repository)
+    parts = parsed.path.strip("/").split("/")
+    if (
+        parsed.netloc != "github.com"
+        or len(parts) != 2
+        or not all(parts)
+        or not GITHUB_LOGIN_RE.fullmatch(parts[0])
+        or not GITHUB_REPOSITORY_RE.fullmatch(parts[1])
+        or repository != f"https://github.com/{parts[0]}/{parts[1]}"
+        or parts[1].endswith(".git")
+    ):
+        _fail("repository must identify one canonical GitHub repository")
     return repository
 
 
-def _load_manifest(path: Path, directory_name: str) -> dict[str, str]:
+def _load_manifest(path: Path, directory_name: str) -> dict[str, object]:
     contents = _read_bounded_regular_file(path, max_bytes=MANIFEST_MAX_BYTES)
     try:
         value = json.loads(
@@ -145,15 +191,61 @@ def _load_manifest(path: Path, directory_name: str) -> dict[str, str]:
     if distribution_name != expected_distribution:
         _fail(f"distribution_name must be {expected_distribution!r}")
 
+    maintainers_value = value["maintainers"]
+    if (
+        not isinstance(maintainers_value, list)
+        or not maintainers_value
+        or len(maintainers_value) > 20
+    ):
+        _fail("maintainers must be a non-empty list with at most 20 entries")
+    maintainers: list[str] = []
+    for maintainer_value in maintainers_value:
+        maintainer = _manifest_string(
+            maintainer_value, "maintainers entry", max_length=39
+        )
+        if not GITHUB_LOGIN_RE.fullmatch(maintainer):
+            _fail("maintainers entries must be GitHub logins")
+        maintainers.append(maintainer)
+    if len(maintainers) != len({maintainer.casefold() for maintainer in maintainers}):
+        _fail("maintainers must not contain duplicates")
+
+    package_index = _manifest_string(
+        value["package_index"], "package_index", max_length=16
+    )
+    if package_index not in PACKAGE_INDEXES:
+        _fail("package_index must be either 'pypi' or 'testpypi'")
+
+    documentation_value = value["documentation"]
+    if (
+        not isinstance(documentation_value, dict)
+        or set(documentation_value) != DOCUMENTATION_KEYS
+    ):
+        _fail("documentation must contain exactly url, hello_world, and extended_description")
+
     return {
         "extension_name": extension_name,
         "distribution_name": distribution_name,
         "description": _manifest_string(
             value["description"], "description", max_length=500
         ),
-        "repository": _validate_repository(value["repository"], "repository"),
+        "repository": _validate_github_repository(value["repository"]),
         "publisher": _manifest_string(value["publisher"], "publisher", max_length=100),
         "license": _manifest_string(value["license"], "license", max_length=200),
+        "maintainers": maintainers,
+        "package_index": package_index,
+        "documentation": {
+            "url": _validate_https_url(documentation_value["url"], "documentation.url"),
+            "hello_world": _manifest_multiline_string(
+                documentation_value["hello_world"],
+                "documentation.hello_world",
+                max_length=4000,
+            ),
+            "extended_description": _manifest_multiline_string(
+                documentation_value["extended_description"],
+                "documentation.extended_description",
+                max_length=12000,
+            ),
+        },
     }
 
 
@@ -186,18 +278,29 @@ def _manifest_paths(manifest_root: Path) -> Iterable[tuple[str, Path]]:
         yield entry.name, entry / MANIFEST_FILENAME
 
 
-def build_catalog(manifest_root: Path = DEFAULT_MANIFEST_ROOT) -> dict[str, object]:
-    """Return the validated catalog derived from *manifest_root*."""
-    extensions = [
+def load_manifests(
+    manifest_root: Path = DEFAULT_MANIFEST_ROOT,
+) -> tuple[dict[str, object], ...]:
+    """Return all validated source manifests in deterministic order."""
+    manifests = [
         _load_manifest(path, name) for name, path in _manifest_paths(manifest_root)
     ]
-    names = [entry["extension_name"] for entry in extensions]
+    names = [entry["extension_name"] for entry in manifests]
     if len(names) != len(set(names)):
         _fail("registry repeats an extension_name")
-    distributions = [entry["distribution_name"] for entry in extensions]
+    distributions = [entry["distribution_name"] for entry in manifests]
     if len(distributions) != len(set(distributions)):
         _fail("registry repeats a distribution_name")
-    extensions.sort(key=lambda entry: entry["extension_name"])
+    manifests.sort(key=lambda entry: entry["extension_name"])
+    return tuple(manifests)
+
+
+def build_catalog(manifest_root: Path = DEFAULT_MANIFEST_ROOT) -> dict[str, object]:
+    """Return the stable discovery catalog derived from *manifest_root*."""
+    extensions = [
+        {key: manifest[key] for key in CATALOG_KEYS}
+        for manifest in load_manifests(manifest_root)
+    ]
     return {"format_version": CATALOG_FORMAT_VERSION, "extensions": extensions}
 
 
@@ -260,7 +363,8 @@ def main() -> int:
             )
             if current != generated:
                 _fail(
-                    f"{arguments.check} is stale; run python -m scripts.build_catalog --output index.json"
+                    f"{arguments.check} is stale; run "
+                    "python -m scripts.build_catalog --output index.json"
                 )
         elif arguments.output is not None:
             _write_atomic(arguments.output, generated)

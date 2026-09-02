@@ -24,6 +24,13 @@ class BuildCatalogTests(unittest.TestCase):
             "repository": "https://github.com/AstroVela/sample",
             "publisher": "AstroVela",
             "license": "Apache-2.0",
+            "maintainers": ["AstroVela"],
+            "package_index": "testpypi",
+            "documentation": {
+                "url": "https://github.com/AstroVela/sample/tree/main/docs",
+                "hello_world": "SELECT sample();",
+                "extended_description": "A longer sample description.",
+            },
         }
         value.update(updates)
         directory = root / name
@@ -48,6 +55,17 @@ class BuildCatalogTests(unittest.TestCase):
                     for entry in build_catalog(root)["extensions"]
                 ],
             )
+
+    def test_catalog_contract_excludes_detail_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._manifest(root)
+
+            entry = build_catalog(root)["extensions"][0]
+
+            self.assertNotIn("maintainers", entry)
+            self.assertNotIn("package_index", entry)
+            self.assertNotIn("documentation", entry)
 
     def test_duplicate_json_key_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -104,6 +122,53 @@ class BuildCatalogTests(unittest.TestCase):
 
             with self.assertRaisesRegex(CatalogBuildError, "canonical HTTPS"):
                 build_catalog(root)
+
+    def test_package_index_must_be_explicitly_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._manifest(root, package_index="private")
+
+            with self.assertRaisesRegex(CatalogBuildError, "package_index"):
+                build_catalog(root)
+
+    def test_maintainers_are_unique_case_insensitively(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._manifest(root, maintainers=["AstroVela", "astrovela"])
+
+            with self.assertRaisesRegex(CatalogBuildError, "duplicates"):
+                build_catalog(root)
+
+    def test_documentation_allows_newlines_but_rejects_other_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._manifest(
+                root,
+                documentation={
+                    "url": "https://github.com/AstroVela/sample/tree/main/docs",
+                    "hello_world": "SELECT 1;\nSELECT 2;",
+                    "extended_description": "Invalid\tdescription",
+                },
+            )
+
+            with self.assertRaisesRegex(CatalogBuildError, "control characters"):
+                build_catalog(root)
+
+    def test_documentation_url_can_target_a_page_fragment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            self._manifest(
+                root,
+                documentation={
+                    "url": "https://example.com/docs?version=1#quick-start",
+                    "hello_world": "SELECT sample();",
+                    "extended_description": "A longer sample description.",
+                },
+            )
+
+            self.assertEqual(
+                build_catalog(root)["extensions"][0]["extension_name"], "sample"
+            )
 
     def test_generated_catalog_must_fit_the_runtime_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

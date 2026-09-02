@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://astrovela.github.io/vane-extensions/schema/download-metrics.schema.json",
+  "title": "Vane extension weekly download metrics",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "format_version",
+    "generated_at",
+    "period",
+    "extensions"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../../schema/download-metrics.schema.json"
+    },
+    "format_version": {
+      "const": 1
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "period": {
+      "const": "last_week"
+    },
+    "extensions": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "extension_name",
+          "distribution_name",
+          "package_index",
+          "downloads_last_week",
+          "source"
+        ],
+        "properties": {
+          "extension_name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$"
+          },
+          "distribution_name": {
+            "type": "string",
+            "pattern": "^vane-extension-[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          },
+          "package_index": {
+            "enum": [
+              "pypi",
+              "testpypi"
+            ]
+          },
+          "downloads_last_week": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "source": {
+            "enum": [
+              "pypistats.org",
+              null
+            ]
+          }
+        },
+        "oneOf": [
+          {
+            "properties": {
+              "package_index": {
+                "const": "pypi"
+              },
+              "downloads_last_week": {
+                "type": "integer"
+              },
+              "source": {
+                "const": "pypistats.org"
+              }
+            }
+          },
+          {
+            "properties": {
+              "downloads_last_week": {
+                "type": "null"
+              },
+              "source": {
+                "type": "null"
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

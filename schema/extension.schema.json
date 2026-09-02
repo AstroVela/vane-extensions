@@ -11,7 +11,10 @@
     "description",
     "repository",
     "publisher",
-    "license"
+    "license",
+    "maintainers",
+    "package_index",
+    "documentation"
   ],
   "properties": {
     "$schema": {
@@ -36,7 +39,7 @@
     "repository": {
       "type": "string",
       "format": "uri",
-      "pattern": "^(?=[\\u0021-\\u007e]+$)https://(?:\\[[^\\]@/?#]+\\]|[^@:/?#]+)/[^?#]+$",
+      "pattern": "^(?!.*\\.git$)https://github\\.com/[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?/[A-Za-z0-9_.-]{1,100}$",
       "maxLength": 2048
     },
     "publisher": {
@@ -50,6 +53,52 @@
       "minLength": 1,
       "maxLength": 200,
       "pattern": "^(?!\\s)(?!.*\\s$)[^\\u0000-\\u001f\\u007f\\ud800-\\udfff]+$"
+    },
+    "maintainers": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 20,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$",
+        "maxLength": 39
+      }
+    },
+    "package_index": {
+      "enum": [
+        "pypi",
+        "testpypi"
+      ]
+    },
+    "documentation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "hello_world",
+        "extended_description"
+      ],
+      "properties": {
+        "url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^(?=[\\u0021-\\u007e]+$)https://",
+          "maxLength": 2048
+        },
+        "hello_world": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000,
+          "pattern": "^(?!\\s)(?![\\s\\S]*\\s$)(?![\\s\\S]*[\\u0000-\\u0009\\u000b-\\u001f\\u007f\\ud800-\\udfff])[\\s\\S]+$"
+        },
+        "extended_description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 12000,
+          "pattern": "^(?!\\s)(?![\\s\\S]*\\s$)(?![\\s\\S]*[\\u0000-\\u0009\\u000b-\\u001f\\u007f\\ud800-\\udfff])[\\s\\S]+$"
+        }
+      }
     }
   }
 }

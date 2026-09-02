@@ -5,5 +5,14 @@
   "description": "Read and write Apache Paimon tables from Vane.",
   "repository": "https://github.com/AstroVela/duckdb-paimon",
   "publisher": "AstroVela",
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "maintainers": [
+    "AstroVela"
+  ],
+  "package_index": "testpypi",
+  "documentation": {
+    "url": "https://github.com/AstroVela/duckdb-paimon/tree/main_vane",
+    "hello_world": "SELECT * FROM paimon_scan('path/to/paimon/table');",
+    "extended_description": "Query and mutate Apache Paimon tables from Vane without a JVM. The provider exposes native catalog, snapshot, local-filesystem, and object-storage access backed by paimon-cpp."
+  }
 }

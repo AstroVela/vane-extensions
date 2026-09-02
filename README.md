@@ -11,6 +11,17 @@ The machine-readable catalog is published by GitHub Pages at:
 https://astrovela.github.io/vane-extensions/v1/index.json
 ```
 
+That endpoint is the small, stable discovery contract consumed by Vane. Rich
+metadata is published separately so documentation and operational fields can
+evolve without requiring a Vane release:
+
+```text
+https://astrovela.github.io/vane-extensions/v1/extensions/index.json
+https://astrovela.github.io/vane-extensions/v1/extensions/<name>.json
+https://astrovela.github.io/vane-extensions/v1/metrics/downloads-last-week.json
+https://astrovela.github.io/vane-extensions/extensions/<name>/
+```
+
 The registry is discovery metadata only. It does not install packages, select
 versions, distribute native artifacts, or grant trust to an artifact. Python
 package indexes resolve and install provider wheels; Vane validates each
@@ -25,27 +36,53 @@ loaded.
    every extension maps to exactly one normalized Python distribution name.
 2. Add `extensions/<name>/extension.json`, following
    `schema/extension.schema.json`.
-3. Run the same checks as CI:
+   Select `pypi` or `testpypi` explicitly; metadata generation never searches
+   or falls back to a different package index. Include at least one GitHub
+   maintainer plus a documentation URL, a representative first query, and a
+   concise extended description.
+3. Run the deterministic checks used by CI:
 
    ```bash
-   python -m pip install check-jsonschema==0.38.0
+   python -m pip install -r requirements.txt
    check-jsonschema --schemafile schema/extension.schema.json extensions/*/extension.json
    python -m scripts.build_catalog --check index.json
    python -m unittest discover -s tests -v
    ```
 
-`index.json` is generated deterministically from the individual manifests and
-must be updated in the same pull request. Do not put package versions, artifact
-URLs, hashes, platform tags, or trust identities in a registry manifest; those
-values belong to immutable provider packages and their Vane descriptors.
+4. Optionally build the complete site against live metadata. `GITHUB_TOKEN`
+   increases the GitHub API rate limit but is not required for public repos:
+
+   ```bash
+   GITHUB_TOKEN=$(gh auth token) python -m scripts.build_site --output _site
+   ```
+
+`index.json` is generated deterministically from the discovery subset of the
+individual manifests and must be updated in the same pull request. Package
+versions and wheel/Python platform availability are derived from the manifest's
+explicit Python package index while GitHub stars come from the repository API.
+PyPI download estimates from `pypistats.org` are published in a separate
+metrics document; TestPyPI does not expose meaningful download counts, so those
+values are `null`. No direct artifact URL, hash, or trust identity is published
+by the registry: those values belong to immutable provider packages and their
+Vane descriptors.
 
 ## Layout
 
 - `extensions/*/extension.json`: one reviewed discovery manifest per extension
 - `schema/extension.schema.json`: the strict manifest schema
+- `schema/*detail*.schema.json`: public enriched-detail service contracts
+- `schema/download-metrics.schema.json`: public metrics service contract
 - `scripts/build_catalog.py`: deterministic catalog generator and validator
+- `scripts/build_site.py`: strict live-metadata enrichment and Pages assembler
 - `index.json`: the reviewed aggregate consumed by Vane
-- `site/`: the human-readable GitHub Pages landing page
+- `site/`: the human-readable GitHub Pages landing page source
+
+The Pages build produces one detail page and JSON document per extension. Each
+contains the reviewed documentation, install/load examples, package publication
+state, latest package version and upload time, `Requires-Python`, available
+Python/ABI/platform wheel tags, GitHub stars, and download metrics when the
+selected index supports them. These values are informational and never
+participate in artifact resolution or trust.
 
 The repository is licensed under the Apache License 2.0. Each manifest records
 the license declared by its provider project; that field does not change the

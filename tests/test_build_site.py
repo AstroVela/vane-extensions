@@ -1,0 +1,301 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from collections.abc import Mapping
+from pathlib import Path
+from unittest.mock import patch
+
+import httpx
+
+from scripts.build_catalog import DEFAULT_MANIFEST_ROOT, PROJECT_ROOT, load_manifests
+from scripts.build_site import (
+    MetadataClient,
+    SiteBuildError,
+    _detail_html,
+    assemble_site,
+    build_details,
+)
+
+GENERATED_AT = "2026-09-02T12:00:00Z"
+
+
+class _FakeMetadataClient:
+    def __init__(self, responses: Mapping[str, object | None]) -> None:
+        self.responses = dict(responses)
+        self.requests: list[tuple[str, Mapping[str, str] | None, bool]] = []
+
+    def get_json(
+        self,
+        url: str,
+        *,
+        headers: Mapping[str, str] | None = None,
+        allow_not_found: bool = False,
+    ) -> object | None:
+        self.requests.append((url, headers, allow_not_found))
+        if url not in self.responses:
+            raise AssertionError(f"unexpected metadata URL: {url}")
+        value = self.responses[url]
+        if value is None and not allow_not_found:
+            raise AssertionError(f"unexpected missing metadata: {url}")
+        return value
+
+
+class MetadataClientTests(unittest.TestCase):
+    def test_not_found_can_be_reported_without_following_redirects(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/missing":
+                return httpx.Response(404)
+            return httpx.Response(
+                302, headers={"Location": "https://example.com/missing"}
+            )
+
+        with MetadataClient(transport=httpx.MockTransport(handler)) as client:
+            self.assertIsNone(
+                client.get_json("https://example.com/missing", allow_not_found=True)
+            )
+            with self.assertRaisesRegex(SiteBuildError, "HTTP 302"):
+                client.get_json("https://example.com/redirect")
+
+    def test_response_size_limit_is_applied_after_decoding(self) -> None:
+        transport = httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=b"12345")
+        )
+
+        with (
+            patch("scripts.build_site.REMOTE_METADATA_MAX_BYTES", 4),
+            MetadataClient(transport=transport) as client,
+            self.assertRaisesRegex(SiteBuildError, "size limit"),
+        ):
+            client.get_json("https://example.com/data")
+
+    def test_duplicate_json_keys_are_rejected(self) -> None:
+        transport = httpx.MockTransport(
+            lambda _request: httpx.Response(200, content=b'{"value": 1, "value": 2}')
+        )
+
+        with MetadataClient(transport=transport) as client:
+            with self.assertRaisesRegex(SiteBuildError, "repeats key"):
+                client.get_json("https://example.com/data")
+
+
+def _github_response(repository: str, stars: int = 7) -> dict[str, object]:
+    return {
+        "full_name": repository.removeprefix("https://github.com/"),
+        "html_url": repository,
+        "stargazers_count": stars,
+    }
+
+
+def _package_response(distribution_name: str, version: str = "0.2.0") -> dict[str, object]:
+    wheel_distribution = distribution_name.replace("-", "_")
+    return {
+        "info": {
+            "name": distribution_name,
+            "version": version,
+            "requires_python": ">=3.10,<3.15",
+        },
+        "urls": [
+            {
+                "packagetype": "bdist_wheel",
+                "yanked": False,
+                "filename": (
+                    f"{wheel_distribution}-{version}-cp310-none-"
+                    "manylinux_2_28_x86_64.whl"
+                ),
+                "upload_time_iso_8601": "2026-09-02T11:00:00Z",
+                "url": "https://files.example/artifact.whl",
+                "digests": {"sha256": "not-published-by-the-registry"},
+            },
+            {
+                "packagetype": "bdist_wheel",
+                "yanked": False,
+                "filename": (
+                    f"{wheel_distribution}-{version}-cp314-none-"
+                    "manylinux_2_28_x86_64.whl"
+                ),
+                "upload_time_iso_8601": "2026-09-02T11:01:00Z",
+            },
+            {
+                "packagetype": "sdist",
+                "yanked": False,
+                "upload_time_iso_8601": "2026-09-02T11:02:00Z",
+            },
+        ],
+    }
+
+
+def _responses_for_checked_in_manifests() -> dict[str, object | None]:
+    responses: dict[str, object | None] = {}
+    for manifest in load_manifests(DEFAULT_MANIFEST_ROOT):
+        repository = str(manifest["repository"])
+        distribution = str(manifest["distribution_name"])
+        responses[
+            f"https://api.github.com/repos/{repository.removeprefix('https://github.com/')}"
+        ] = _github_response(repository)
+        responses[f"https://test.pypi.org/pypi/{distribution}/json"] = (
+            None
+            if manifest["extension_name"] == "lance"
+            else _package_response(distribution)
+        )
+    return responses
+
+
+class BuildSiteTests(unittest.TestCase):
+    def test_build_details_enriches_without_exposing_artifact_locations(self) -> None:
+        details = build_details(
+            generated_at=GENERATED_AT,
+            client=_FakeMetadataClient(_responses_for_checked_in_manifests()),
+            github_token="test-token",
+        )
+
+        iceberg = next(
+            detail for detail in details if detail["extension_name"] == "iceberg"
+        )
+        self.assertEqual(iceberg["source"], {"github_stars": 7})
+        self.assertEqual(iceberg["package"]["python_versions"], ["3.10", "3.14"])
+        self.assertEqual(
+            iceberg["package"]["platform_tags"], ["manylinux_2_28_x86_64"]
+        )
+        self.assertEqual(iceberg["package"]["abi_tags"], ["none"])
+        self.assertEqual(iceberg["package"]["wheel_count"], 2)
+        self.assertEqual(
+            iceberg["package"]["latest_release_uploaded_at"],
+            "2026-09-02T11:02:00Z",
+        )
+        serialized = json.dumps(iceberg)
+        self.assertNotIn("files.example", serialized)
+        self.assertNotIn("not-published-by-the-registry", serialized)
+
+    def test_missing_package_is_reported_without_cross_index_fallback(self) -> None:
+        client = _FakeMetadataClient(_responses_for_checked_in_manifests())
+
+        details = build_details(generated_at=GENERATED_AT, client=client)
+
+        lance = next(
+            detail for detail in details if detail["extension_name"] == "lance"
+        )
+        self.assertFalse(lance["package"]["published"])
+        self.assertIsNone(lance["package"]["latest_version"])
+        lance_requests = [
+            url for url, _headers, _missing in client.requests if "lance" in url
+        ]
+        self.assertIn(
+            "https://test.pypi.org/pypi/vane-extension-lance/json", lance_requests
+        )
+        self.assertFalse(any("https://pypi.org/" in url for url in lance_requests))
+
+    def test_assemble_site_preserves_catalog_and_writes_details_and_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory) / "site"
+
+            details = assemble_site(
+                output,
+                generated_at=GENERATED_AT,
+                client=_FakeMetadataClient(_responses_for_checked_in_manifests()),
+            )
+
+            self.assertEqual(
+                (output / "v1" / "index.json").read_bytes(),
+                (PROJECT_ROOT / "index.json").read_bytes(),
+            )
+            self.assertTrue(
+                (output / "extensions" / "iceberg" / "index.html").is_file()
+            )
+            aggregate = json.loads(
+                (output / "v1" / "extensions" / "index.json").read_text()
+            )
+            self.assertEqual(len(aggregate["extensions"]), len(details))
+            self.assertNotIn("documentation", aggregate["extensions"][0])
+            self.assertEqual(
+                json.loads(
+                    (output / "v1" / "extensions" / "iceberg.json").read_text()
+                )["$schema"],
+                "../../schema/extension-detail.schema.json",
+            )
+            metrics = json.loads(
+                (output / "v1" / "metrics" / "downloads-last-week.json").read_text()
+            )
+            self.assertTrue(
+                all(
+                    entry["downloads_last_week"] is None
+                    for entry in metrics["extensions"]
+                )
+            )
+
+    def test_pypi_package_gets_separate_download_metrics(self) -> None:
+        manifest = dict(load_manifests(DEFAULT_MANIFEST_ROOT)[0])
+        manifest["package_index"] = "pypi"
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://pypi.org/pypi/{distribution}/json": _package_response(
+                distribution
+            ),
+            f"https://pypistats.org/api/packages/{distribution}/recent": {
+                "data": {"last_week": 123}
+            },
+        }
+
+        detail = build_details(
+            manifest_root=self._single_manifest_root(manifest),
+            generated_at=GENERATED_AT,
+            client=_FakeMetadataClient(responses),
+        )[0]
+
+        self.assertEqual(
+            detail["metrics"],
+            {"downloads_last_week": 123, "source": "pypistats.org"},
+        )
+        self.assertEqual(
+            detail["installation"]["install_command"],
+            f"python -m pip install vane-ai {distribution}",
+        )
+
+    def test_detail_html_escapes_reviewed_text(self) -> None:
+        detail = build_details(
+            generated_at=GENERATED_AT,
+            client=_FakeMetadataClient(_responses_for_checked_in_manifests()),
+        )[0]
+        detail["documentation"] = {
+            **detail["documentation"],
+            "extended_description": "<script>alert(1)</script>",
+        }
+
+        page = _detail_html(detail)
+
+        self.assertNotIn("<script>alert(1)</script>", page)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", page)
+
+    def test_existing_output_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            output = Path(temporary_directory)
+
+            with self.assertRaisesRegex(SiteBuildError, "already exists"):
+                assemble_site(
+                    output,
+                    generated_at=GENERATED_AT,
+                    client=_FakeMetadataClient({}),
+                )
+
+    def _single_manifest_root(self, manifest: Mapping[str, object]) -> Path:
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        root = Path(temporary_directory.name)
+        extension_name = str(manifest["extension_name"])
+        directory = root / extension_name
+        directory.mkdir()
+        (directory / "extension.json").write_text(
+            json.dumps({"$schema": "../../schema/extension.schema.json", **manifest}),
+            encoding="utf-8",
+        )
+        return root
+
+
+if __name__ == "__main__":
+    unittest.main()
