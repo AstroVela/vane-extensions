@@ -24,7 +24,7 @@
     },
     "distribution_name": {
       "type": "string",
-      "pattern": "^vane-extension-[a-z][a-z0-9-]*$",
+      "pattern": "^vane-extension-[a-z](?:[a-z0-9-]*[a-z0-9])?$",
       "maxLength": 256
     },
     "description": {
@@ -36,7 +36,7 @@
     "repository": {
       "type": "string",
       "format": "uri",
-      "pattern": "^https://[^/?#]+/[^?#]+$",
+      "pattern": "^(?=[\\u0021-\\u007e]+$)https://(?:\\[[^\\]@/?#]+\\]|[^@:/?#]+)/[^?#]+$",
       "maxLength": 2048
     },
     "publisher": {

@@ -57,7 +57,7 @@ def _reject_duplicate_object_pairs(
 
 def _read_bounded_regular_file(path: Path, *, max_bytes: int) -> bytes:
     if path.is_symlink() or not path.is_file():
-        _fail(f"{path} must be a regular file, not a symlink")
+        _fail(f"{path} must be a regular file")
     try:
         size = path.stat().st_size
     except OSError as exception:
@@ -157,7 +157,7 @@ def _load_manifest(path: Path, directory_name: str) -> dict[str, str]:
 
 def _manifest_paths(manifest_root: Path) -> Iterable[tuple[str, Path]]:
     if manifest_root.is_symlink() or not manifest_root.is_dir():
-        _fail(f"{manifest_root} must be a directory, not a symlink")
+        _fail(f"{manifest_root} must be a directory")
     try:
         entries = sorted(manifest_root.iterdir(), key=lambda path: path.name)
     except OSError as exception:

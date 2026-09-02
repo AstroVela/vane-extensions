@@ -7,8 +7,8 @@ from pathlib import Path
 
 from scripts.build_catalog import (
     CATALOG_MAX_BYTES,
-    CatalogBuildError,
     PROJECT_ROOT,
+    CatalogBuildError,
     build_catalog,
     catalog_bytes,
 )
