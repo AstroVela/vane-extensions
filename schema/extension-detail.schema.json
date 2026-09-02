@@ -114,6 +114,47 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "package": {
+            "properties": {
+              "published": {
+                "const": false
+              }
+            },
+            "required": [
+              "published"
+            ]
+          }
+        },
+        "required": [
+          "package"
+        ]
+      },
+      "then": {
+        "properties": {
+          "installation": {
+            "properties": {
+              "install_commands": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "installation": {
+            "properties": {
+              "install_commands": {
+                "minItems": 1
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -176,6 +217,7 @@
         "published",
         "latest_version",
         "requires_python",
+        "requires_dist",
         "wheel_count",
         "python_versions",
         "python_tags",
@@ -211,6 +253,16 @@
             "null"
           ],
           "maxLength": 4096
+        },
+        "requires_dist": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
         },
         "wheel_count": {
           "type": "integer",
@@ -276,6 +328,9 @@
               "requires_python": {
                 "type": "null"
               },
+              "requires_dist": {
+                "maxItems": 0
+              },
               "wheel_count": {
                 "const": 0
               },
@@ -311,14 +366,19 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "install_command",
+        "install_commands",
         "load_example"
       ],
       "properties": {
-        "install_command": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 4096
+        "install_commands": {
+          "type": "array",
+          "maxItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
         },
         "load_example": {
           "type": "string",

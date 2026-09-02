@@ -40,6 +40,8 @@
         <dd>{{ package.latest_release_uploaded_at or "Unknown" }}</dd>
         <dt>Package index</dt><dd>{{ package.index }}</dd>
         <dt>Requires Python</dt><dd>{{ package.requires_python or "Unknown" }}</dd>
+        <dt>Package requirements</dt>
+        <dd>{{ package.requires_dist | join(", ") or "None" }}</dd>
         <dt>Python wheels</dt><dd>{{ package.wheel_count }} · {{ python_versions }}</dd>
         <dt>Wheel Python tags</dt><dd>{{ package.python_tags | join(", ") or "None" }}</dd>
         <dt>Wheel ABI tags</dt><dd>{{ abi_tags }}</dd>
@@ -59,7 +61,11 @@
         <dt>Documentation</dt><dd><a href="{{ documentation.url }}">Provider documentation</a></dd>
       </dl>
       <h2>Install</h2>
-      <pre><code>{{ installation.install_command }}</code></pre>
+      {% if installation.install_commands %}
+      <pre><code>{{ installation.install_commands | join("\n") }}</code></pre>
+      {% else %}
+      <p>No install command is available until this package is published.</p>
+      {% endif %}
       <h2>Load</h2>
       <pre><code>{{ installation.load_example }}</code></pre>
       <h2>Hello world</h2>

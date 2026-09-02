@@ -44,6 +44,9 @@
       code {
         overflow-wrap: anywhere;
       }
+      .install {
+        white-space: pre-wrap;
+      }
       .title-row {
         align-items: baseline;
         display: flex;
@@ -105,7 +108,10 @@
             details.href = `extensions/${entry.extension_name}/`;
             details.textContent = "Details";
             description.textContent = entry.description;
-            command.textContent = entry.installation.install_command;
+            command.className = "install";
+            command.textContent = entry.installation.install_commands.length
+              ? entry.installation.install_commands.join("\n")
+              : "No install command is available until this package is published.";
             facts.className = "facts meta";
             const version = document.createElement("span");
             const stars = document.createElement("span");

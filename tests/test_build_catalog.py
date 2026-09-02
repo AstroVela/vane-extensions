@@ -42,6 +42,13 @@ class BuildCatalogTests(unittest.TestCase):
     def test_checked_in_catalog_is_current(self) -> None:
         self.assertEqual((PROJECT_ROOT / "index.json").read_bytes(), catalog_bytes())
 
+    def test_registry_must_contain_at_least_one_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+
+            with self.assertRaisesRegex(CatalogBuildError, "at least one"):
+                build_catalog(root)
+
     def test_catalog_is_sorted_deterministically(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

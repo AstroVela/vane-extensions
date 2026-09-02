@@ -23,5 +23,6 @@
 - [ ] The manifest contains reviewed discovery and documentation metadata only.
 - [ ] The package index and GitHub maintainers are explicit and correct.
 - [ ] The examples do not contain credentials, private endpoints, or personal paths.
+- [ ] TestPyPI recipes keep Vane-owned packages isolated from the PyPI index.
 - [ ] `index.json` was generated from the manifests and was not edited independently.
 - [ ] Derived versions, wheel tags, stars, and metrics remain outside the stable discovery catalog.

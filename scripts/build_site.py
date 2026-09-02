@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 from collections.abc import Mapping
@@ -17,6 +18,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
+from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.utils import (
     InvalidWheelFilename,
@@ -38,18 +40,27 @@ AGGREGATE_MAX_JSON_BYTES = 8 * 1024 * 1024
 REMOTE_METADATA_MAX_BYTES = 8 * 1024 * 1024
 REMOTE_METADATA_TIMEOUT_SECONDS = 15.0
 METADATA_MAX_WORKERS = 16
+PACKAGE_REQUIREMENTS_MAX_COUNT = 256
+VANE_REQUIREMENTS_MAX_COUNT = 64
 _PYTHON_TAG_RE = re.compile(r"^(?:cp|pp)([0-9])([0-9]+)$")
+_OPTIONAL_EXTRA_MARKER_RE = re.compile(
+    r'(?:^|[ (])extra\s*==\s*"[^"]+"'
+)
 _UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
 _PACKAGE_INDEXES = {
     "pypi": {
         "api": "https://pypi.org/pypi/{distribution}/json",
+        "release_api": "https://pypi.org/pypi/{distribution}/{version}/json",
         "project": "https://pypi.org/project/{distribution}/",
+        "simple": "https://pypi.org/simple/",
     },
     "testpypi": {
         "api": "https://test.pypi.org/pypi/{distribution}/json",
+        "release_api": "https://test.pypi.org/pypi/{distribution}/{version}/json",
         "project": "https://test.pypi.org/project/{distribution}/",
+        "simple": "https://test.pypi.org/simple/",
     },
 }
 _TEMPLATE_ENVIRONMENT = Environment(
@@ -223,28 +234,59 @@ def _python_version_from_tag(interpreter: str) -> str | None:
     return f"{match.group(1)}.{int(match.group(2))}"
 
 
+def _package_requirements(
+    info: Mapping[str, object], distribution_name: str
+) -> tuple[Requirement, ...]:
+    raw_requirements = info.get("requires_dist")
+    if raw_requirements is None:
+        return ()
+    if (
+        not isinstance(raw_requirements, list)
+        or len(raw_requirements) > PACKAGE_REQUIREMENTS_MAX_COUNT
+    ):
+        _fail(f"package requirements are invalid for {distribution_name}")
+    requirements: dict[str, Requirement] = {}
+    for raw_requirement in raw_requirements:
+        requirement_text = _string(raw_requirement, "package requirement")
+        if not isinstance(requirement_text, str):
+            _fail(f"package requirement is missing for {distribution_name}")
+        try:
+            requirement = Requirement(requirement_text)
+        except InvalidRequirement as exception:
+            raise SiteBuildError(
+                f"package requirement is invalid for {distribution_name}"
+            ) from exception
+        normalized = str(requirement)
+        requirements[normalized] = requirement
+    return tuple(requirements[key] for key in sorted(requirements, key=str.casefold))
+
+
 def _package_metadata(
     distribution_name: str, package_index: str, client: JsonMetadataClient
-) -> dict[str, object]:
+) -> tuple[dict[str, object], tuple[Requirement, ...]]:
     index = _PACKAGE_INDEXES[package_index]
     escaped_distribution = quote(distribution_name, safe="-")
     api_url = index["api"].format(distribution=escaped_distribution)
     project_url = index["project"].format(distribution=escaped_distribution)
     value = client.get_json(api_url, allow_not_found=True)
     if value is None:
-        return {
-            "index": package_index,
-            "project_url": project_url,
-            "published": False,
-            "latest_version": None,
-            "requires_python": None,
-            "wheel_count": 0,
-            "python_versions": [],
-            "python_tags": [],
-            "abi_tags": [],
-            "platform_tags": [],
-            "latest_release_uploaded_at": None,
-        }
+        return (
+            {
+                "index": package_index,
+                "project_url": project_url,
+                "published": False,
+                "latest_version": None,
+                "requires_python": None,
+                "requires_dist": [],
+                "wheel_count": 0,
+                "python_versions": [],
+                "python_tags": [],
+                "abi_tags": [],
+                "platform_tags": [],
+                "latest_release_uploaded_at": None,
+            },
+            (),
+        )
 
     document = _mapping(value, f"package metadata for {distribution_name}")
     info = _mapping(document.get("info"), f"package info for {distribution_name}")
@@ -274,6 +316,7 @@ def _package_metadata(
             raise SiteBuildError(
                 f"package Requires-Python is invalid for {distribution_name}"
             ) from exception
+    requirements = _package_requirements(info, distribution_name)
     raw_files = document.get("urls")
     if not isinstance(raw_files, list):
         _fail(f"package urls must be a list for {distribution_name}")
@@ -331,19 +374,23 @@ def _package_metadata(
     latest_release_uploaded_at = (
         max(upload_times, key=lambda item: item[0])[1] if upload_times else None
     )
-    return {
-        "index": package_index,
-        "project_url": project_url,
-        "published": True,
-        "latest_version": version_text,
-        "requires_python": requires_python,
-        "wheel_count": wheel_count,
-        "python_versions": sorted(python_versions, key=Version),
-        "python_tags": sorted(python_tags),
-        "abi_tags": sorted(abi_tags),
-        "platform_tags": sorted(platform_tags),
-        "latest_release_uploaded_at": latest_release_uploaded_at,
-    }
+    return (
+        {
+            "index": package_index,
+            "project_url": project_url,
+            "published": True,
+            "latest_version": version_text,
+            "requires_python": requires_python,
+            "requires_dist": [str(requirement) for requirement in requirements],
+            "wheel_count": wheel_count,
+            "python_versions": sorted(python_versions, key=Version),
+            "python_tags": sorted(python_tags),
+            "abi_tags": sorted(abi_tags),
+            "platform_tags": sorted(platform_tags),
+            "latest_release_uploaded_at": latest_release_uploaded_at,
+        },
+        requirements,
+    )
 
 
 def _download_metadata(
@@ -366,24 +413,216 @@ def _download_metadata(
     return {"downloads_last_week": downloads, "source": "pypistats.org"}
 
 
+def _is_vane_distribution(distribution_name: str) -> bool:
+    normalized = canonicalize_name(distribution_name)
+    return normalized == "vane-ai" or normalized.startswith("vane-extension-")
+
+
+def _is_unselected_extra_requirement(requirement: Requirement) -> bool:
+    """Return whether a marker is certainly false when no extra is selected."""
+    if requirement.marker is None:
+        return False
+    marker = str(requirement.marker)
+    return " or " not in marker and _OPTIONAL_EXTRA_MARKER_RE.search(marker) is not None
+
+
+def _exact_internal_requirement(
+    requirement: Requirement, parent_distribution: str
+) -> tuple[str, str]:
+    normalized_name = canonicalize_name(requirement.name)
+    specifiers = list(requirement.specifier)
+    if (
+        requirement.url is not None
+        or requirement.extras
+        or requirement.marker is not None
+        or len(specifiers) != 1
+        or specifiers[0].operator not in {"==", "==="}
+        or "*" in specifiers[0].version
+    ):
+        _fail(
+            f"{parent_distribution} must pin Vane dependency "
+            f"{normalized_name} to one exact package-index version"
+        )
+    version_text = specifiers[0].version
+    try:
+        Version(version_text)
+    except InvalidVersion as exception:
+        raise SiteBuildError(
+            f"{parent_distribution} has an invalid Vane dependency version"
+        ) from exception
+    return normalized_name, version_text
+
+
+def _release_requirements(
+    requirement: Requirement,
+    *,
+    parent_distribution: str,
+    package_index: str,
+    client: JsonMetadataClient,
+) -> tuple[str, tuple[Requirement, ...]]:
+    distribution_name, requested_version = _exact_internal_requirement(
+        requirement, parent_distribution
+    )
+    index = _PACKAGE_INDEXES[package_index]
+    url = index["release_api"].format(
+        distribution=quote(distribution_name, safe="-"),
+        version=quote(requested_version, safe=""),
+    )
+    value = client.get_json(url)
+    document = _mapping(
+        value, f"package release metadata for {distribution_name}"
+    )
+    info = _mapping(
+        document.get("info"), f"package release info for {distribution_name}"
+    )
+    reported_name = _string(info.get("name"), "package release info.name")
+    reported_version = _string(info.get("version"), "package release info.version")
+    if not isinstance(reported_version, str):
+        _fail(f"package release version is missing for {distribution_name}")
+    try:
+        Version(reported_version)
+    except InvalidVersion as exception:
+        raise SiteBuildError(
+            f"package release version is invalid for {distribution_name}"
+        ) from exception
+    if (
+        not isinstance(reported_name, str)
+        or canonicalize_name(reported_name) != distribution_name
+        or not requirement.specifier.contains(reported_version, prereleases=True)
+    ):
+        _fail(
+            f"package release metadata identity does not match {requirement}"
+        )
+    return reported_version, _package_requirements(info, distribution_name)
+
+
+def _shell_command(arguments: list[str]) -> str:
+    return " ".join(shlex.quote(argument) for argument in arguments)
+
+
+def _testpypi_install_commands(
+    distribution_name: str,
+    version_text: str,
+    requirements: tuple[Requirement, ...],
+    client: JsonMetadataClient,
+) -> list[str]:
+    root_name = canonicalize_name(distribution_name)
+    selected_versions: dict[str, str] = {root_name: version_text}
+    pending = list(requirements)
+    public_requirements: set[str] = set()
+    while pending:
+        requirement = pending.pop()
+        if _is_unselected_extra_requirement(requirement):
+            continue
+        normalized_name = canonicalize_name(requirement.name)
+        if not _is_vane_distribution(normalized_name):
+            if requirement.url is not None:
+                _fail(
+                    f"{distribution_name} has an unsupported direct URL dependency"
+                )
+            public_requirements.add(str(requirement))
+            if len(public_requirements) > PACKAGE_REQUIREMENTS_MAX_COUNT:
+                _fail(f"public dependency closure is too large for {distribution_name}")
+            continue
+
+        dependency_name, _requested_version = _exact_internal_requirement(
+            requirement, distribution_name
+        )
+        selected_version = selected_versions.get(dependency_name)
+        if selected_version is not None:
+            if not requirement.specifier.contains(
+                selected_version, prereleases=True
+            ):
+                _fail(f"Vane dependency versions conflict for {dependency_name}")
+            continue
+        if len(selected_versions) >= VANE_REQUIREMENTS_MAX_COUNT:
+            _fail(f"Vane dependency closure is too large for {distribution_name}")
+        reported_version, child_requirements = _release_requirements(
+            requirement,
+            parent_distribution=distribution_name,
+            package_index="testpypi",
+            client=client,
+        )
+        selected_versions[dependency_name] = reported_version
+        pending.extend(child_requirements)
+
+    commands: list[str] = []
+    if public_requirements:
+        commands.append(
+            _shell_command(
+                [
+                    "python",
+                    "-m",
+                    "pip",
+                    "install",
+                    "--index-url",
+                    _PACKAGE_INDEXES["pypi"]["simple"],
+                    *sorted(public_requirements, key=str.casefold),
+                ]
+            )
+        )
+    commands.append(
+        _shell_command(
+            [
+                "python",
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "--only-binary=:all:",
+                "--index-url",
+                _PACKAGE_INDEXES["testpypi"]["simple"],
+                *(
+                    f"{name}==={selected_versions[name]}"
+                    for name in sorted(selected_versions)
+                ),
+            ]
+        )
+    )
+    if any(len(command) > 4096 for command in commands):
+        _fail(f"generated install command is too long for {distribution_name}")
+    return commands
+
+
 def _installation_metadata(
-    extension_name: str, distribution_name: str, package_index: str
-) -> dict[str, str]:
-    if package_index == "testpypi":
-        install_command = (
-            "python -m pip install --pre "
-            "--index-url https://test.pypi.org/simple/ "
-            "--extra-index-url https://pypi.org/simple/ "
-            f"vane-ai {distribution_name}"
+    extension_name: str,
+    distribution_name: str,
+    package_index: str,
+    package: Mapping[str, object],
+    requirements: tuple[Requirement, ...],
+    client: JsonMetadataClient,
+) -> dict[str, object]:
+    version_text = package["latest_version"]
+    if not package["published"]:
+        install_commands: list[str] = []
+    elif not isinstance(version_text, str):
+        _fail(f"published package version is missing for {distribution_name}")
+    elif package_index == "testpypi":
+        install_commands = _testpypi_install_commands(
+            distribution_name, version_text, requirements, client
         )
     else:
-        install_command = f"python -m pip install vane-ai {distribution_name}"
+        install_commands = [
+            _shell_command(
+                [
+                    "python",
+                    "-m",
+                    "pip",
+                    "install",
+                    "--index-url",
+                    _PACKAGE_INDEXES["pypi"]["simple"],
+                    f"{distribution_name}==={version_text}",
+                ]
+            )
+        ]
+    if any(len(command) > 4096 for command in install_commands):
+        _fail(f"generated install command is too long for {distribution_name}")
     load_example = (
         "import vane\n\n"
         'connection = vane.connect(\":memory:\")\n'
         f'vane.load_installed_extension("{extension_name}", connection=connection)'
     )
-    return {"install_command": install_command, "load_example": load_example}
+    return {"install_commands": install_commands, "load_example": load_example}
 
 
 def _detail_record(
@@ -397,7 +636,9 @@ def _detail_record(
     distribution_name = str(manifest["distribution_name"])
     repository = str(manifest["repository"])
     package_index = str(manifest["package_index"])
-    package = _package_metadata(distribution_name, package_index, client)
+    package, requirements = _package_metadata(
+        distribution_name, package_index, client
+    )
     metrics = _download_metadata(
         distribution_name, package_index, bool(package["published"]), client
     )
@@ -416,7 +657,12 @@ def _detail_record(
         "source": _github_metadata(repository, client, github_token),
         "package": package,
         "installation": _installation_metadata(
-            extension_name, distribution_name, package_index
+            extension_name,
+            distribution_name,
+            package_index,
+            package,
+            requirements,
+            client,
         ),
         "metrics": metrics,
     }
@@ -432,6 +678,8 @@ def build_details(
     """Return enriched detail records for every reviewed manifest."""
     _timestamp(generated_at, "generated_at")
     manifests = load_manifests(manifest_root)
+    if not manifests:
+        _fail("registry must contain at least one extension manifest")
     with ThreadPoolExecutor(
         max_workers=min(METADATA_MAX_WORKERS, len(manifests)),
         thread_name_prefix="registry-metadata",
@@ -485,7 +733,7 @@ def _summary_record(detail: Mapping[str, object]) -> dict[str, object]:
                 "python_tags",
             )
         },
-        "installation": {"install_command": installation["install_command"]},
+        "installation": {"install_commands": installation["install_commands"]},
     }
 
 

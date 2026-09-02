@@ -56,6 +56,13 @@ loaded.
    GITHUB_TOKEN=$(gh auth token) python -m scripts.build_site --output _site
    ```
 
+For TestPyPI packages, the generated installation recipe keeps indexes
+isolated. It first installs ordinary dependencies from PyPI, then installs the
+exact Vane and extension wheels from TestPyPI with dependency resolution
+disabled. The registry never emits `--extra-index-url`, because pip gives no
+priority to the primary index and that pattern is vulnerable to dependency
+confusion.
+
 `index.json` is generated deterministically from the discovery subset of the
 individual manifests and must be updated in the same pull request. Package
 versions and wheel/Python platform availability are derived from the manifest's
@@ -80,9 +87,9 @@ Vane descriptors.
 The Pages build produces one detail page and JSON document per extension. Each
 contains the reviewed documentation, install/load examples, package publication
 state, latest package version and upload time, `Requires-Python`, available
-Python/ABI/platform wheel tags, GitHub stars, and download metrics when the
-selected index supports them. These values are informational and never
-participate in artifact resolution or trust.
+Python/ABI/platform wheel tags, validated direct package requirements, GitHub
+stars, and download metrics when the selected index supports them. These values
+are informational and never participate in artifact resolution or trust.
 
 The repository is licensed under the Apache License 2.0. Each manifest records
 the license declared by its provider project; that field does not change the

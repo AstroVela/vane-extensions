@@ -88,13 +88,19 @@ def _github_response(repository: str, stars: int = 7) -> dict[str, object]:
     }
 
 
-def _package_response(distribution_name: str, version: str = "0.2.0") -> dict[str, object]:
+def _package_response(
+    distribution_name: str,
+    version: str = "0.2.0",
+    *,
+    requires_dist: list[str] | None = None,
+) -> dict[str, object]:
     wheel_distribution = distribution_name.replace("-", "_")
     return {
         "info": {
             "name": distribution_name,
             "version": version,
             "requires_python": ">=3.10,<3.15",
+            "requires_dist": requires_dist or [],
         },
         "urls": [
             {
@@ -126,6 +132,18 @@ def _package_response(distribution_name: str, version: str = "0.2.0") -> dict[st
     }
 
 
+def _release_response(
+    distribution_name: str, version: str, requires_dist: list[str]
+) -> dict[str, object]:
+    return {
+        "info": {
+            "name": distribution_name,
+            "version": version,
+            "requires_dist": requires_dist,
+        }
+    }
+
+
 def _responses_for_checked_in_manifests() -> dict[str, object | None]:
     responses: dict[str, object | None] = {}
     for manifest in load_manifests(DEFAULT_MANIFEST_ROOT):
@@ -140,6 +158,14 @@ def _responses_for_checked_in_manifests() -> dict[str, object | None]:
             else _package_response(distribution)
         )
     return responses
+
+
+def _checked_in_manifest(extension_name: str) -> dict[str, object]:
+    return next(
+        manifest
+        for manifest in load_manifests(DEFAULT_MANIFEST_ROOT)
+        if manifest["extension_name"] == extension_name
+    )
 
 
 class BuildSiteTests(unittest.TestCase):
@@ -178,6 +204,7 @@ class BuildSiteTests(unittest.TestCase):
         )
         self.assertFalse(lance["package"]["published"])
         self.assertIsNone(lance["package"]["latest_version"])
+        self.assertEqual(lance["installation"]["install_commands"], [])
         lance_requests = [
             url for url, _headers, _missing in client.requests if "lance" in url
         ]
@@ -225,7 +252,7 @@ class BuildSiteTests(unittest.TestCase):
             )
 
     def test_pypi_package_gets_separate_download_metrics(self) -> None:
-        manifest = dict(load_manifests(DEFAULT_MANIFEST_ROOT)[0])
+        manifest = dict(_checked_in_manifest("iceberg"))
         manifest["package_index"] = "pypi"
         distribution = str(manifest["distribution_name"])
         repository = str(manifest["repository"])
@@ -253,15 +280,121 @@ class BuildSiteTests(unittest.TestCase):
             {"downloads_last_week": 123, "source": "pypistats.org"},
         )
         self.assertEqual(
-            detail["installation"]["install_command"],
-            f"python -m pip install vane-ai {distribution}",
+            detail["installation"]["install_commands"],
+            [
+                "python -m pip install --index-url https://pypi.org/simple/ "
+                f"{distribution}===0.2.0"
+            ],
         )
 
-    def test_detail_html_escapes_reviewed_text(self) -> None:
+    def test_testpypi_installation_keeps_indexes_isolated(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        provider_version = "0.2.0"
+        vane_version = "0.2.0.dev1"
+        avro_version = "0.2.0"
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                distribution,
+                provider_version,
+                requires_dist=[
+                    f"vane-ai==={vane_version}",
+                    f"vane-extension-avro==={avro_version}",
+                ],
+            ),
+            f"https://test.pypi.org/pypi/vane-ai/{vane_version}/json": (
+                _release_response(
+                    "vane-ai",
+                    vane_version,
+                    [
+                        "numpy>=2",
+                        "typing-extensions",
+                        'optional-sdk; extra == "openai"',
+                        'platform-marker; sys_platform == "extra"',
+                        'default-extra; extra != "openai"',
+                    ],
+                )
+            ),
+            f"https://test.pypi.org/pypi/vane-extension-avro/{avro_version}/json": (
+                _release_response(
+                    "vane-extension-avro",
+                    avro_version,
+                    [f"vane-ai==={vane_version}"],
+                )
+            ),
+        }
+
         detail = build_details(
+            manifest_root=self._single_manifest_root(manifest),
             generated_at=GENERATED_AT,
-            client=_FakeMetadataClient(_responses_for_checked_in_manifests()),
+            client=_FakeMetadataClient(responses),
         )[0]
+
+        public_command, testpypi_command = detail["installation"][
+            "install_commands"
+        ]
+        self.assertEqual(
+            detail["package"]["requires_dist"],
+            [
+                f"vane-ai==={vane_version}",
+                f"vane-extension-avro==={avro_version}",
+            ],
+        )
+        self.assertIn("--index-url https://pypi.org/simple/", public_command)
+        self.assertIn("'numpy>=2'", public_command)
+        self.assertIn("typing-extensions", public_command)
+        self.assertIn("platform-marker", public_command)
+        self.assertIn("default-extra", public_command)
+        self.assertNotIn("test.pypi.org", public_command)
+        self.assertNotIn("vane-", public_command)
+        self.assertNotIn("optional-sdk", public_command)
+        self.assertIn("--no-deps", testpypi_command)
+        self.assertIn("--only-binary=:all:", testpypi_command)
+        self.assertIn("--index-url https://test.pypi.org/simple/", testpypi_command)
+        self.assertIn(f"vane-ai==={vane_version}", testpypi_command)
+        self.assertIn(f"vane-extension-avro==={avro_version}", testpypi_command)
+        self.assertIn(f"{distribution}==={provider_version}", testpypi_command)
+        self.assertNotIn("https://pypi.org/simple/", testpypi_command)
+        self.assertNotIn(
+            "--extra-index-url", "\n".join(detail["installation"]["install_commands"])
+        )
+
+    def test_testpypi_vane_dependencies_must_use_exact_versions(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                distribution,
+                requires_dist=["vane-ai>=0.2"],
+            ),
+        }
+
+        with self.assertRaisesRegex(SiteBuildError, "one exact"):
+            build_details(
+                manifest_root=self._single_manifest_root(manifest),
+                generated_at=GENERATED_AT,
+                client=_FakeMetadataClient(responses),
+            )
+
+    def test_detail_html_escapes_reviewed_text(self) -> None:
+        detail = next(
+            detail
+            for detail in build_details(
+                generated_at=GENERATED_AT,
+                client=_FakeMetadataClient(_responses_for_checked_in_manifests()),
+            )
+            if detail["extension_name"] == "iceberg"
+        )
         detail["documentation"] = {
             **detail["documentation"],
             "extended_description": "<script>alert(1)</script>",
