@@ -658,6 +658,12 @@ def _wheel_python_environment(tag: Tag) -> BaseMarker:
         interpreter != "cp" or (major, minor) < (3, 2)
     ):
         return EmptyMarker()
+    if tag.abi == "abi3t":
+        # PEP 803 starts supported abi3t builds at 3.15. packaging deliberately
+        # accepts older cpXY targets for experimental backports, which the
+        # registry does not promise. Preserve any higher target's own floor.
+        runtime_major, runtime_minor = max((major, minor), (3, 15))
+        version = f"{runtime_major}.{runtime_minor}"
     if interpreter == "py" or tag.abi in {"abi3", "abi3t"}:
         version_environment = MultiMarker.of(
             from_pkg_marker(Marker(f'python_version >= "{version}"')),

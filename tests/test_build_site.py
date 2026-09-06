@@ -1354,6 +1354,7 @@ class BuildSiteTests(unittest.TestCase):
         incompatible_tags = {
             "version": "cp39-none-manylinux_2_28_x86_64",
             "invalid-stable-ABI": "cp27-abi3-manylinux_2_28_x86_64",
+            "pre-315-free-threaded-stable-ABI": "cp37-abi3t-manylinux_2_28_x86_64",
             "mismatched-interpreter-ABI": "cp310-cp39-manylinux_2_28_x86_64",
             "unsupported-native-ABI": "cp310-unknown-manylinux_2_28_x86_64",
             "premature-free-threaded-ABI": "cp310-cp310t-manylinux_2_28_x86_64",
@@ -1441,6 +1442,54 @@ class BuildSiteTests(unittest.TestCase):
                     client=_FakeMetadataClient(responses),
                     public_resolver=_FakePublicDependencyResolver(()),
                 )
+
+    def test_testpypi_abi3t_requires_a_matching_python_315_runtime(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        cases = {
+            "free-threaded-runtime": ("cp315t", "cp37", True),
+            "GIL-runtime": ("cp315", "cp37", False),
+            "newer-limited-API": ("cp315t", "cp316", False),
+        }
+        for case, (runtime_abi, api_target, compatible) in cases.items():
+            responses = {
+                (
+                    "https://api.github.com/repos/"
+                    f"{repository.removeprefix('https://github.com/')}"
+                ): _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                    distribution,
+                    requires_python=">=3.15,<3.16",
+                    requires_dist=["vane-ai===1.0"],
+                    wheel_tags=(f"cp315-{runtime_abi}-manylinux_2_28_x86_64",),
+                ),
+                "https://test.pypi.org/pypi/vane-ai/1.0/json": _release_response(
+                    "vane-ai",
+                    "1.0",
+                    [],
+                    requires_python=">=3.15,<3.17",
+                    wheel_tags=(f"{api_target}-abi3t-manylinux_2_28_x86_64",),
+                ),
+            }
+            with self.subTest(case=case):
+                arguments = {
+                    "manifest_root": self._single_manifest_root(manifest),
+                    "generated_at": GENERATED_AT,
+                    "client": _FakeMetadataClient(responses),
+                    "public_resolver": _FakePublicDependencyResolver(()),
+                }
+                if compatible:
+                    detail = build_details(**arguments)[0]
+                    self.assertIn(
+                        "vane-ai===1.0",
+                        detail["installation"]["posix_install_script"],
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        SiteBuildError, "has no non-yanked wheel compatible"
+                    ):
+                        build_details(**arguments)
 
     def test_testpypi_accepts_standard_compatible_wheel_tags(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))

@@ -93,7 +93,9 @@ the build. A bounded search also requires a common environment for the entire
 internal wheel closure, including the effective conditions of each release;
 pairwise overlap alone is insufficient. Native ABI validation currently covers
 CPython and PyPy; other interpreter families require ABI-independent (`none`)
-wheels. Direct-URL requirements are omitted
+wheels. The free-threaded Stable ABI (`abi3t`) requires runtime 3.15 or later,
+following PEP 803's supported builds; experimental backports are not promised.
+Direct-URL requirements are omitted
 from published JSON and HTML so artifact locations or embedded credentials
 cannot leak through package metadata.
 
