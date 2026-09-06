@@ -786,10 +786,10 @@ def _abi_tags_overlap(left: str, right: str) -> bool:
     if left == "none" or right == "none" or left == right:
         return True
     for runtime_abi, required_abi in ((left, right), (right, left)):
-        match = re.fullmatch(r"cp([0-9])([0-9]+)(t?)(d?)", runtime_abi)
+        match = _CPYTHON_ABI_RE.fullmatch(runtime_abi)
         if match is None:
             continue
-        major, minor, _threaded, debug = match.groups()
+        major, minor, _threaded, debug, _pymalloc, _ucs4 = match.groups()
         version = (int(major), int(minor))
         if version[1] > 99:
             continue

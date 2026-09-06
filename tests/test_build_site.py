@@ -23,6 +23,7 @@ from scripts.build_site import (
     MetadataClient,
     SiteBuildError,
     UvPublicDependencyResolver,
+    _abi_tags_overlap,
     _detail_html,
     _parse_public_lock,
     _powershell_install_script,
@@ -1521,9 +1522,16 @@ class BuildSiteTests(unittest.TestCase):
                 "py3-none-any",
                 "pp310-pypy310_pp73-manylinux_2_28_x86_64",
             ),
+            "pymalloc-stable-ABI": (
+                "cp37-cp37m-manylinux_2_28_x86_64",
+                "cp34-abi3-manylinux_2_28_x86_64",
+            ),
         }
 
         for case, (provider_tag, dependency_tag) in compatible_tags.items():
+            requires_python = (
+                ">=3.4,<3.8" if case == "pymalloc-stable-ABI" else ">=3.10,<3.15"
+            )
             responses = {
                 (
                     "https://api.github.com/repos/"
@@ -1533,6 +1541,7 @@ class BuildSiteTests(unittest.TestCase):
                     _package_response(
                         distribution,
                         requires_dist=[f"vane-ai==={vane_version}"],
+                        requires_python=requires_python,
                         wheel_tags=(provider_tag,),
                     )
                 ),
@@ -1541,6 +1550,7 @@ class BuildSiteTests(unittest.TestCase):
                         "vane-ai",
                         vane_version,
                         [],
+                        requires_python=requires_python,
                         wheel_tags=(dependency_tag,),
                     )
                 ),
@@ -1556,6 +1566,14 @@ class BuildSiteTests(unittest.TestCase):
                 self.assertIsNotNone(
                     detail["installation"]["posix_install_script"]
                 )
+
+    def test_cpython_abi_overlap_uses_the_complete_native_abi_form(self) -> None:
+        for abi in ("cp37m", "cp32mu"):
+            with self.subTest(abi=abi):
+                self.assertTrue(_abi_tags_overlap(abi, "abi3"))
+                self.assertTrue(_abi_tags_overlap("abi3", abi))
+        self.assertFalse(_abi_tags_overlap("cp27mu", "abi3"))
+        self.assertFalse(_abi_tags_overlap("cp37m", "cp37dm"))
 
     def test_testpypi_requires_a_common_environment_for_all_internal_wheels(
         self,
