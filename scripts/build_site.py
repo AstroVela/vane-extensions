@@ -862,6 +862,8 @@ def _validate_wheel_closure(
     selected_conditions: Mapping[tuple[str, str], BaseMarker],
     release_python_environments: Mapping[tuple[str, str], BaseMarker],
     release_wheel_tags: Mapping[tuple[str, str], frozenset[Tag]],
+    *,
+    environment: BaseMarker,
 ) -> None:
     """Find one environment that can install all simultaneously active releases."""
     releases = sorted(
@@ -923,8 +925,8 @@ def _validate_wheel_closure(
                 return True
         return False
 
-    if not search(0, AnyMarker(), ()):
-        _fail(f"{distribution_name} internal wheel closure has no common environment")
+    if not search(0, environment, ()):
+        _fail(f"{distribution_name} wheel closure has no common environment")
 
 
 def _conditioned_requirement(
@@ -1239,7 +1241,7 @@ class UvPublicDependencyResolver:
 _PUBLIC_DEPENDENCY_RESOLVER = UvPublicDependencyResolver()
 
 
-def _exact_internal_requirement(
+def _exact_index_requirement(
     requirement: Requirement, parent_distribution: str
 ) -> tuple[str, str]:
     normalized_name = canonicalize_name(requirement.name)
@@ -1252,7 +1254,7 @@ def _exact_internal_requirement(
         or "*" in specifiers[0].version
     ):
         _fail(
-            f"{parent_distribution} must pin Vane dependency "
+            f"{parent_distribution} must pin dependency "
             f"{normalized_name} to one exact package-index version"
         )
     version_text = specifiers[0].version
@@ -1260,19 +1262,19 @@ def _exact_internal_requirement(
         Version(version_text)
     except InvalidVersion as exception:
         raise SiteBuildError(
-            f"{parent_distribution} has an invalid Vane dependency version"
+            f"{parent_distribution} has an invalid dependency version"
         ) from exception
     return normalized_name, version_text
 
 
-def _release_requirements(
+def _release_metadata(
     requirement: Requirement,
     *,
     parent_distribution: str,
     package_index: str,
     client: JsonMetadataClient,
-) -> tuple[str, BaseMarker, tuple[Requirement, ...], frozenset[Tag]]:
-    distribution_name, requested_version = _exact_internal_requirement(
+) -> tuple[str, BaseMarker, Mapping[str, object], frozenset[Tag]]:
+    distribution_name, requested_version = _exact_index_requirement(
         requirement, parent_distribution
     )
     index = _PACKAGE_INDEXES[package_index]
@@ -1328,7 +1330,7 @@ def _release_requirements(
     return (
         reported_version,
         python_environment,
-        _package_requirements(info, distribution_name),
+        info,
         wheel_tags,
     )
 
@@ -1346,6 +1348,63 @@ def _pip_install_arguments(
         index_url,
         *requirements,
     ]
+
+
+def _validate_public_wheel_closure(
+    public_lock: tuple[str, ...],
+    *,
+    distribution_name: str,
+    client: JsonMetadataClient,
+    python_environment: BaseMarker,
+    selected_conditions: Mapping[tuple[str, str], BaseMarker],
+    release_python_environments: Mapping[tuple[str, str], BaseMarker],
+    release_wheel_tags: Mapping[tuple[str, str], frozenset[Tag]],
+) -> None:
+    # Keep these separate from the caller's TestPyPI pins: public dependencies
+    # participate in validation, never in the TestPyPI installation step.
+    conditions = dict(selected_conditions)
+    environments = dict(release_python_environments)
+    wheel_tags = dict(release_wheel_tags)
+    requirements = tuple(map(Requirement, public_lock))
+
+    def load(
+        requirement: Requirement,
+    ) -> tuple[str, BaseMarker, Mapping[str, object], frozenset[Tag]]:
+        return _release_metadata(
+            requirement,
+            parent_distribution=distribution_name,
+            package_index="pypi",
+            client=client,
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=min(METADATA_MAX_WORKERS, len(requirements)),
+        thread_name_prefix="registry-public-wheels",
+    ) as executor:
+        for requirement, (version, release_environment, _metadata, tags) in zip(
+            requirements, executor.map(load, requirements), strict=True
+        ):
+            key = (canonicalize_name(requirement.name), version)
+            condition = (
+                AnyMarker()
+                if requirement.marker is None
+                else from_pkg_marker(requirement.marker)
+            )
+            conditions[key] = MarkerUnion.of(
+                conditions.get(key, EmptyMarker()), condition
+            )
+            environments[key] = intersection(
+                environments.get(key, AnyMarker()), release_environment
+            )
+            wheel_tags[key] = wheel_tags.get(key, tags) & tags
+
+    _validate_wheel_closure(
+        distribution_name,
+        conditions,
+        environments,
+        wheel_tags,
+        environment=python_environment,
+    )
 
 
 def _posix_install_script(commands: list[list[str]]) -> str | None:
@@ -1464,7 +1523,7 @@ def _testpypi_install_arguments(
             if len(public_requirements) > PACKAGE_REQUIREMENTS_MAX_COUNT:
                 _fail(f"public dependency closure is too large for {distribution_name}")
             continue
-        dependency_name, requested_version = _exact_internal_requirement(
+        dependency_name, requested_version = _exact_index_requirement(
             requirement, distribution_name
         )
         selected_key = next(
@@ -1483,9 +1542,9 @@ def _testpypi_install_arguments(
                 (
                     reported_version,
                     child_python_environment,
-                    child_requirements,
+                    child_metadata,
                     child_wheel_tags,
-                ) = _release_requirements(
+                ) = _release_metadata(
                     requirement,
                     parent_distribution=distribution_name,
                     package_index="testpypi",
@@ -1494,7 +1553,8 @@ def _testpypi_install_arguments(
                 selected_key = (dependency_name, reported_version)
                 release_aliases[alias] = selected_key
                 release_requirements.setdefault(
-                    selected_key, child_requirements
+                    selected_key,
+                    _package_requirements(child_metadata, dependency_name),
                 )
                 release_python_environments.setdefault(
                     selected_key, child_python_environment
@@ -1557,6 +1617,7 @@ def _testpypi_install_arguments(
         selected_conditions,
         release_python_environments,
         release_wheel_tags,
+        environment=python_environment,
     )
     commands: list[list[str]] = []
     if public_requirements:
@@ -1572,6 +1633,15 @@ def _testpypi_install_arguments(
             reject_vane=True,
         )
         if public_lock:
+            _validate_public_wheel_closure(
+                public_lock,
+                distribution_name=distribution_name,
+                client=client,
+                python_environment=python_environment,
+                selected_conditions=selected_conditions,
+                release_python_environments=release_python_environments,
+                release_wheel_tags=release_wheel_tags,
+            )
             commands.append(
                 _pip_install_arguments(
                     _PACKAGE_INDEXES["pypi"]["simple"], public_lock
@@ -1595,6 +1665,7 @@ def _pypi_install_arguments(
     distribution_name: str,
     version_text: str,
     package: Mapping[str, object],
+    client: JsonMetadataClient,
     public_resolver: PublicDependencyResolver,
 ) -> list[str]:
     if package["wheel_count"] == 0:
@@ -1641,6 +1712,17 @@ def _pypi_install_arguments(
             else text
             for text in locked_requirements
         )
+    _validate_public_wheel_closure(
+        locked_requirements,
+        distribution_name=distribution_name,
+        client=client,
+        python_environment=_python_environment_marker(
+            requires_python, distribution_name
+        ),
+        selected_conditions={},
+        release_python_environments={},
+        release_wheel_tags={},
+    )
     return _pip_install_arguments(
         _PACKAGE_INDEXES["pypi"]["simple"], locked_requirements
     )
@@ -1679,6 +1761,7 @@ def _installation_metadata(
                 distribution_name,
                 version_text,
                 package,
+                client,
                 public_resolver,
             )
         ]

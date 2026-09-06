@@ -177,6 +177,7 @@ class PublicDependencyResolverTests(unittest.TestCase):
                     name,
                     "1.0",
                     {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+                    _FakeMetadataClient(_public_release_responses(f"{name}==1.0")),
                     _FakePublicDependencyResolver((pin,)),
                 )
                 self.assertEqual(arguments[-1], f"{name}==1.0")
@@ -185,6 +186,7 @@ class PublicDependencyResolverTests(unittest.TestCase):
                 name,
                 "1.0",
                 {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+                _FakeMetadataClient({}),
                 _FakePublicDependencyResolver(
                     (f'{name}==1.0; python_full_version >= "3.12"',)
                 ),
@@ -207,8 +209,129 @@ class PublicDependencyResolverTests(unittest.TestCase):
                     _resolver_python_lower_bound(requires_python), expected
                 )
 
+    def test_pypi_wheels_must_share_an_environment_with_the_root(self) -> None:
+        name = "vane-extension-test"
+        pins = (f"{name}==1.0", "public-sdk==1.0")
+        for public_tag, compatible in (
+            ("py3-none-any", True),
+            ("cp310-cp310-win_amd64", False),
+        ):
+            responses = {
+                f"https://pypi.org/pypi/{name}/1.0/json": _release_response(
+                    name,
+                    "1.0",
+                    [],
+                    wheel_tags=("cp310-none-manylinux_2_28_x86_64",),
+                ),
+                "https://pypi.org/pypi/public-sdk/1.0/json": _release_response(
+                    "public-sdk",
+                    "1.0",
+                    [],
+                    wheel_tags=(public_tag,),
+                ),
+            }
+            with self.subTest(public_tag=public_tag):
+                arguments = (
+                    name,
+                    "1.0",
+                    {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+                    _FakeMetadataClient(responses),
+                    _FakePublicDependencyResolver(pins),
+                )
+                if compatible:
+                    self.assertIn(
+                        "public-sdk==1.0", _pypi_install_arguments(*arguments)
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        SiteBuildError, "no common environment"
+                    ):
+                        _pypi_install_arguments(*arguments)
+
+    def test_pypi_wheel_validation_stays_within_declared_python_range(self) -> None:
+        name = "vane-extension-test"
+        pins = (f"{name}==1.0", 'public-sdk==1.0; python_version >= "3.10"')
+        responses = {
+            f"https://pypi.org/pypi/{name}/1.0/json": _release_response(
+                name,
+                "1.0",
+                [],
+                requires_python=None,
+                wheel_tags=("py3-none-manylinux_2_28_x86_64",),
+            ),
+            "https://pypi.org/pypi/public-sdk/1.0/json": _release_response(
+                "public-sdk",
+                "1.0",
+                [],
+                wheel_tags=("cp310-cp310-win_amd64",),
+            ),
+        }
+        with self.assertRaisesRegex(SiteBuildError, "no common environment"):
+            _pypi_install_arguments(
+                name,
+                "1.0",
+                {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+                _FakeMetadataClient(responses),
+                _FakePublicDependencyResolver(pins),
+            )
+
+    def test_public_release_metadata_is_fetched_concurrently(self) -> None:
+        name = "vane-extension-test"
+        pins = (f"{name}==1.0", "public-sdk==1.0")
+        barrier = Barrier(2)
+
+        class ParallelClient(_FakeMetadataClient):
+            def get_json(self, url: str, **kwargs: object) -> object:
+                barrier.wait(timeout=5)
+                return super().get_json(url, **kwargs)
+
+        arguments = _pypi_install_arguments(
+            name,
+            "1.0",
+            {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+            ParallelClient(_public_release_responses(*pins)),
+            _FakePublicDependencyResolver(pins),
+        )
+        self.assertIn("public-sdk==1.0", arguments)
+
+    def test_public_wheel_validation_does_not_reparse_unselected_extras(self) -> None:
+        name = "vane-extension-test"
+        pins = (f"{name}==1.0", "public-sdk==1.0")
+        responses = _public_release_responses(*pins)
+        responses["https://pypi.org/pypi/public-sdk/1.0/json"]["info"][
+            "requires_dist"
+        ] = [f'optional-{index}; extra == "unused"' for index in range(300)]
+        arguments = _pypi_install_arguments(
+            name,
+            "1.0",
+            {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+            _FakeMetadataClient(responses),
+            _FakePublicDependencyResolver(pins),
+        )
+        self.assertIn("public-sdk==1.0", arguments)
+        self.assertNotIn("optional-", " ".join(arguments))
+
+    def test_public_sdist_only_release_is_rejected(self) -> None:
+        name = "vane-extension-test"
+        pins = (f"{name}==1.0", "public-sdk==1.0")
+        responses = _public_release_responses(*pins)
+        responses["https://pypi.org/pypi/public-sdk/1.0/json"] = _sdist_only_response(
+            "public-sdk", "1.0"
+        )
+        with self.assertRaisesRegex(SiteBuildError, "non-yanked wheel"):
+            _pypi_install_arguments(
+                name,
+                "1.0",
+                {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+                _FakeMetadataClient(responses),
+                _FakePublicDependencyResolver(pins),
+            )
+
     def test_resolver_markers_preserve_compatible_release_precision(self) -> None:
-        for requires_python, next_minor_supported in (("~=3.10", True), ("~=3.10.4", False)):
+        for requires_python, next_minor_supported in (
+            ("~=3.10", True),
+            ("~=3.10.4", False),
+        ):
             with self.subTest(requires_python=requires_python):
                 requirement = Requirement(
                     _resolver_requirements(("public-package==1",), requires_python)[0]
@@ -527,6 +650,18 @@ def _sdist_only_response(
     return response
 
 
+def _public_release_responses(*pins: str) -> dict[str, object]:
+    result = {}
+    for pin in pins:
+        requirement = Requirement(pin)
+        name = canonicalize_name(requirement.name)
+        version = next(iter(requirement.specifier)).version
+        result[f"https://pypi.org/pypi/{name}/{version}/json"] = _release_response(
+            name, version, [], wheel_tags=("py3-none-any",)
+        )
+    return result
+
+
 def _responses_for_checked_in_manifests() -> dict[str, object | None]:
     responses: dict[str, object | None] = {}
     for manifest in load_manifests(DEFAULT_MANIFEST_ROOT):
@@ -795,6 +930,7 @@ class BuildSiteTests(unittest.TestCase):
         public_resolver = _FakePublicDependencyResolver(
             ("public-transitive==1.2.3", f"{distribution}==0.2.0")
         )
+        responses.update(_public_release_responses(*public_resolver.resolved))
 
         detail = build_details(
             manifest_root=self._single_manifest_root(manifest),
@@ -928,6 +1064,7 @@ class BuildSiteTests(unittest.TestCase):
                 "typing-extensions==4.16.0",
             )
         )
+        responses.update(_public_release_responses(*public_resolver.resolved))
 
         detail = build_details(
             manifest_root=self._single_manifest_root(manifest),
@@ -1073,6 +1210,7 @@ class BuildSiteTests(unittest.TestCase):
                 'old-public==1.2; python_version < "3.14"',
             )
         )
+        responses.update(_public_release_responses(*public_resolver.resolved))
 
         detail = build_details(
             manifest_root=self._single_manifest_root(manifest),
@@ -1575,6 +1713,122 @@ class BuildSiteTests(unittest.TestCase):
         self.assertFalse(_abi_tags_overlap("cp27mu", "abi3"))
         self.assertFalse(_abi_tags_overlap("cp37m", "cp37dm"))
 
+    def test_public_wheels_share_the_entire_internal_environment(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        linux_tag = "cp310-cp310-manylinux_2_28_x86_64"
+        windows_tag = "cp310-cp310-win_amd64"
+        universal_tag = "py3-none-any"
+        cases = {
+            "platform-mismatch": (
+                linux_tag,
+                universal_tag,
+                (windows_tag,),
+                None,
+                False,
+            ),
+            "internal-restricts-platform": (
+                universal_tag,
+                linux_tag,
+                (windows_tag,),
+                None,
+                False,
+            ),
+            "disjoint-public-siblings": (
+                universal_tag,
+                universal_tag,
+                (linux_tag, windows_tag),
+                None,
+                False,
+            ),
+            "inactive-platform-dependency": (
+                linux_tag,
+                linux_tag,
+                (windows_tag,),
+                'sys_platform == "win32"',
+                True,
+            ),
+            "compatible-public-wheel": (
+                linux_tag,
+                linux_tag,
+                (universal_tag,),
+                None,
+                True,
+            ),
+            "python-mismatch": (
+                linux_tag,
+                universal_tag,
+                ("cp39-none-manylinux_2_28_x86_64",),
+                None,
+                False,
+            ),
+            "ABI-mismatch": (
+                "cp313-cp313-manylinux_2_28_x86_64",
+                universal_tag,
+                ("cp313-cp313t-manylinux_2_28_x86_64",),
+                None,
+                False,
+            ),
+        }
+        for case, (
+            provider_tag,
+            internal_tag,
+            public_tags,
+            condition,
+            compatible,
+        ) in cases.items():
+            pins = tuple(
+                f"public-sdk-{index}==1.0" + (f"; {condition}" if condition else "")
+                for index in range(len(public_tags))
+            )
+            responses = {
+                (
+                    "https://api.github.com/repos/"
+                    f"{repository.removeprefix('https://github.com/')}"
+                ): _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                    distribution,
+                    requires_dist=["vane-ai===1.0", *pins],
+                    wheel_tags=(provider_tag,),
+                ),
+                "https://test.pypi.org/pypi/vane-ai/1.0/json": _release_response(
+                    "vane-ai",
+                    "1.0",
+                    [],
+                    wheel_tags=(internal_tag,),
+                ),
+                **{
+                    f"https://pypi.org/pypi/public-sdk-{index}/1.0/json": _release_response(
+                        f"public-sdk-{index}",
+                        "1.0",
+                        [],
+                        requires_python=">=3.9,<3.15",
+                        wheel_tags=(tag,),
+                    )
+                    for index, tag in enumerate(public_tags)
+                },
+            }
+            with self.subTest(case=case):
+                arguments = {
+                    "manifest_root": self._single_manifest_root(manifest),
+                    "generated_at": GENERATED_AT,
+                    "client": _FakeMetadataClient(responses),
+                    "public_resolver": _FakePublicDependencyResolver(pins),
+                }
+                if compatible:
+                    detail = build_details(**arguments)[0]
+                    public_step, internal_step = detail["installation"][
+                        "posix_install_script"
+                    ].split(" &&\n")
+                    self.assertIn("public-sdk-0==1.0", public_step)
+                    self.assertNotIn("public-sdk", internal_step)
+                else:
+                    with self.assertRaisesRegex(
+                        SiteBuildError, "no common environment"
+                    ):
+                        build_details(**arguments)
+
     def test_testpypi_requires_a_common_environment_for_all_internal_wheels(
         self,
     ) -> None:
@@ -1634,7 +1888,7 @@ class BuildSiteTests(unittest.TestCase):
                     )
                 else:
                     with self.assertRaisesRegex(
-                        SiteBuildError, "internal wheel closure has no common environment"
+                        SiteBuildError, "wheel closure has no common environment"
                     ):
                         build_details(**arguments)
 

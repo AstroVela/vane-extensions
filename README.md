@@ -91,7 +91,13 @@ release must also support every Python environment in that range where its
 incoming condition is active; an incompatible `Requires-Python` closure fails
 the build. A bounded search also requires a common environment for the entire
 internal wheel closure, including the effective conditions of each release;
-pairwise overlap alone is insufficient. Native ABI validation currently covers
+pairwise overlap alone is insufficient. After public resolution, the exact PyPI
+release wheel metadata is fetched concurrently and added to the same common-
+environment check, with each lock marker preserved. A universal public lock
+alone does not prove compatibility with a provider's platform. Public pins
+remain separate from the TestPyPI installation step. Their dependency metadata
+is resolved by `uv`, not re-parsed by the Vane-owned dependency graph walker.
+Native ABI validation covers
 CPython and PyPy; other interpreter families require ABI-independent (`none`)
 wheels. The free-threaded Stable ABI (`abi3t`) requires runtime 3.15 or later,
 following PEP 803's supported builds; experimental backports are not promised.
