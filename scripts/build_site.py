@@ -928,7 +928,7 @@ def _powershell_install_script(commands: list[list[str]]) -> str | None:
         "  $__vanePipConfigFileWasSet = Test-Path Env:PIP_CONFIG_FILE",
         "  $__vanePipConfigFile = $env:PIP_CONFIG_FILE",
         "  try {",
-        "    $env:PIP_CONFIG_FILE = 'NUL'",
+        "    $env:PIP_CONFIG_FILE = 'nul'",
     ]
     for arguments in commands:
         quoted_arguments = " ".join(

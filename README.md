@@ -60,7 +60,7 @@ For TestPyPI packages, the generated installation recipes keep indexes
 isolated. The service publishes separately labeled POSIX-shell and Windows
 PowerShell scripts. POSIX steps set `PIP_CONFIG_FILE=/dev/null` and are joined
 with `&&`; PowerShell uses its native environment-variable syntax and the
-Windows `NUL` device inside a guarded `try`/`finally` block that restores the
+Windows `nul` device inside a guarded `try`/`finally` block that restores the
 caller's prior environment. Every pip invocation also passes the `--isolated`
 global option to ignore the remaining environment variables. The recipe first
 uses `uv` to resolve the complete public dependency closure across the

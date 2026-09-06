@@ -415,10 +415,10 @@ class BuildSiteTests(unittest.TestCase):
             "$__vanePipConfigFileWasSet = Test-Path Env:PIP_CONFIG_FILE", script
         )
         self.assertIn("$__vanePipConfigFile = $env:PIP_CONFIG_FILE", script)
-        self.assertIn("$env:PIP_CONFIG_FILE = 'NUL'", script)
+        self.assertIn("$env:PIP_CONFIG_FILE = 'nul'", script)
         self.assertLess(
             script.index("$__vanePipConfigFile = $env:PIP_CONFIG_FILE"),
-            script.index("$env:PIP_CONFIG_FILE = 'NUL'"),
+            script.index("$env:PIP_CONFIG_FILE = 'nul'"),
         )
         self.assertIn(
             "'package==1; platform_machine == \"O''Reilly\"'", script
