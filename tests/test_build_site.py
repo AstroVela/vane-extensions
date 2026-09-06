@@ -298,13 +298,14 @@ def _package_response(
     version: str = "0.2.0",
     *,
     requires_dist: list[str] | None = None,
+    requires_python: str | None = ">=3.10,<3.15",
 ) -> dict[str, object]:
     wheel_distribution = distribution_name.replace("-", "_")
     return {
         "info": {
             "name": distribution_name,
             "version": version,
-            "requires_python": ">=3.10,<3.15",
+            "requires_python": requires_python,
             "requires_dist": requires_dist or [],
         },
         "urls": [
@@ -338,10 +339,17 @@ def _package_response(
 
 
 def _release_response(
-    distribution_name: str, version: str, requires_dist: list[str]
+    distribution_name: str,
+    version: str,
+    requires_dist: list[str],
+    *,
+    requires_python: str | None = ">=3.10,<3.15",
 ) -> dict[str, object]:
     return _package_response(
-        distribution_name, version, requires_dist=requires_dist
+        distribution_name,
+        version,
+        requires_dist=requires_dist,
+        requires_python=requires_python,
     )
 
 
@@ -475,6 +483,35 @@ class BuildSiteTests(unittest.TestCase):
         serialized = json.dumps(iceberg)
         self.assertNotIn("files.example", serialized)
         self.assertNotIn("not-published-by-the-registry", serialized)
+
+    def test_versioned_generic_python_wheel_tag_is_reported(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        package = _package_response(distribution)
+        package_urls = package["urls"]
+        assert isinstance(package_urls, list)
+        first_wheel = package_urls[0]
+        assert isinstance(first_wheel, dict)
+        first_wheel["filename"] = (
+            f"{distribution.replace('-', '_')}-0.2.0-py310-none-any.whl"
+        )
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": package,
+        }
+
+        detail = build_details(
+            manifest_root=self._single_manifest_root(manifest),
+            generated_at=GENERATED_AT,
+            client=_FakeMetadataClient(responses),
+        )[0]
+
+        self.assertEqual(detail["package"]["python_versions"], ["3.10", "3.14"])
+        self.assertEqual(detail["package"]["python_tags"], ["cp314", "py310"])
 
     def test_missing_package_is_reported_without_cross_index_fallback(self) -> None:
         client = _FakeMetadataClient(_responses_for_checked_in_manifests())
@@ -786,10 +823,16 @@ class BuildSiteTests(unittest.TestCase):
                     "vane-ai",
                     older_vane,
                     ['old-public>=1; platform_machine == "x86_64"'],
+                    requires_python=">=3.10,<3.14",
                 )
             ),
             f"https://test.pypi.org/pypi/vane-ai/{newer_vane}/json": (
-                _release_response("vane-ai", newer_vane, ["new-public>=2"])
+                _release_response(
+                    "vane-ai",
+                    newer_vane,
+                    ["new-public>=2"],
+                    requires_python=">=3.14,<3.15",
+                )
             ),
         }
         public_resolver = _FakePublicDependencyResolver(
@@ -863,6 +906,41 @@ class BuildSiteTests(unittest.TestCase):
             if canonicalize_name(requirement.name) == "vane-extension-avro"
         )
         self.assertEqual(str(avro.marker), 'sys_platform == "linux"')
+
+    def test_testpypi_rejects_incompatible_internal_requires_python(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        vane_version = "0.2.0.dev1"
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                distribution,
+                requires_dist=[f"vane-ai==={vane_version}"],
+                requires_python=">=3.10,<3.12",
+            ),
+            f"https://test.pypi.org/pypi/vane-ai/{vane_version}/json": (
+                _release_response(
+                    "vane-ai",
+                    vane_version,
+                    [],
+                    requires_python=">=3.12",
+                )
+            ),
+        }
+
+        with self.assertRaisesRegex(
+            SiteBuildError, "vane-ai==0.2.0.dev1 Requires-Python is incompatible"
+        ):
+            build_details(
+                manifest_root=self._single_manifest_root(manifest),
+                generated_at=GENERATED_AT,
+                client=_FakeMetadataClient(responses),
+                public_resolver=_FakePublicDependencyResolver(()),
+            )
 
     def test_testpypi_rejects_overlapping_internal_versions(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))

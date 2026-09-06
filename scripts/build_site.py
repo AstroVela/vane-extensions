@@ -60,7 +60,7 @@ VANE_REQUIREMENTS_MAX_COUNT = 64
 PUBLIC_LOCK_MAX_BYTES = 64 * 1024
 PUBLIC_LOCK_MAX_COUNT = 512
 PUBLIC_LOCK_TIMEOUT_SECONDS = 120.0
-_PYTHON_TAG_RE = re.compile(r"^(?:cp|pp)([0-9])([0-9]+)$")
+_PYTHON_TAG_RE = re.compile(r"^(?:cp|pp|py)([0-9])([0-9]+)$")
 _UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
@@ -837,7 +837,7 @@ def _release_requirements(
     parent_distribution: str,
     package_index: str,
     client: JsonMetadataClient,
-) -> tuple[str, tuple[Requirement, ...]]:
+) -> tuple[str, BaseMarker, tuple[Requirement, ...]]:
     distribution_name, requested_version = _exact_internal_requirement(
         requirement, parent_distribution
     )
@@ -876,7 +876,19 @@ def _release_requirements(
     )
     if file_metadata["wheel_count"] == 0:
         _fail(f"{distribution_name} does not publish a non-yanked wheel")
-    return reported_version, _package_requirements(info, distribution_name)
+    requires_python = _string(
+        info.get("requires_python"),
+        "package release info.requires_python",
+        nullable=True,
+    )
+    python_environment = _python_environment_marker(
+        requires_python, distribution_name
+    )
+    return (
+        reported_version,
+        python_environment,
+        _package_requirements(info, distribution_name),
+    )
 
 
 def _shell_command(arguments: list[str]) -> str:
@@ -902,6 +914,9 @@ def _testpypi_install_commands(
     release_requirements: dict[
         tuple[str, str], tuple[Requirement, ...]
     ] = {root_key: requirements}
+    release_python_environments: dict[tuple[str, str], BaseMarker] = {
+        root_key: python_environment
+    }
     release_aliases: dict[tuple[str, str], tuple[str, str]] = {}
     pending = [(requirement, AnyMarker()) for requirement in requirements]
     public_requirements: set[str] = set()
@@ -944,7 +959,11 @@ def _testpypi_install_commands(
             alias = (dependency_name, requested_version)
             selected_key = release_aliases.get(alias)
             if selected_key is None:
-                reported_version, child_requirements = _release_requirements(
+                (
+                    reported_version,
+                    child_python_environment,
+                    child_requirements,
+                ) = _release_requirements(
                     requirement,
                     parent_distribution=distribution_name,
                     package_index="testpypi",
@@ -955,6 +974,21 @@ def _testpypi_install_commands(
                 release_requirements.setdefault(
                     selected_key, child_requirements
                 )
+                release_python_environments.setdefault(
+                    selected_key, child_python_environment
+                )
+
+        dependency_python_environment = release_python_environments[selected_key]
+        unsupported_environment = MultiMarker.of(
+            python_environment,
+            condition,
+            ~dependency_python_environment,
+        )
+        if not unsupported_environment.is_empty():
+            _fail(
+                f"{dependency_name}=={selected_key[1]} Requires-Python is "
+                f"incompatible with {distribution_name}"
+            )
 
         for other_key, other_condition in selected_conditions.items():
             if (
