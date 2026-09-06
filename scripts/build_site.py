@@ -32,11 +32,19 @@ from dep_logic.markers import (
     MultiMarker,
     from_pkg_marker,
 )
+from dep_logic.markers.utils import intersection
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from packaging.markers import Marker
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
-from packaging.tags import Tag, mac_platforms
+from packaging.tags import (
+    InvalidTag,
+    Tag,
+    TooManyTagsError,
+    cpython_tags,
+    mac_platforms,
+    parse_tag,
+)
 from packaging.utils import (
     InvalidWheelFilename,
     canonicalize_name,
@@ -59,6 +67,7 @@ REMOTE_METADATA_TIMEOUT_SECONDS = 15.0
 METADATA_MAX_WORKERS = 16
 PACKAGE_REQUIREMENTS_MAX_COUNT = 256
 PACKAGE_WHEEL_TAGS_MAX_COUNT = 512
+WHEEL_CLOSURE_MAX_STEPS = 100_000
 VANE_REQUIREMENTS_MAX_COUNT = 64
 PUBLIC_LOCK_MAX_BYTES = 64 * 1024
 PUBLIC_LOCK_MAX_COUNT = 512
@@ -69,6 +78,7 @@ _BROAD_PYTHON_TAG_RE = re.compile(r"^py([0-9])$")
 _VERSIONED_INTERPRETER_TAG_RE = re.compile(
     r"^([a-z][a-z0-9_]*?)([0-9])([0-9]+)$"
 )
+_CPYTHON_ABI_RE = re.compile(r"cp([0-9])([0-9]+)(t?)(d?)(m?)(u?)")
 _LINUX_PLATFORM_RE = re.compile(
     r"^(manylinux(?:_[0-9]+_[0-9]+|1|2010|2014)|"
     r"musllinux_[0-9]+_[0-9]+|linux)_(.+)$"
@@ -350,10 +360,15 @@ def _package_file_metadata(
         if not isinstance(filename, str):
             _fail(f"package filename is missing for {distribution_name}")
         try:
+            # Bound compressed tag expansion before parsing the full filename.
+            parse_tag(
+                "-".join(filename.removesuffix(".whl").rsplit("-", 3)[-3:]),
+                limit=PACKAGE_WHEEL_TAGS_MAX_COUNT,
+            )
             wheel_name, wheel_version, _build, parsed_tags = parse_wheel_filename(
                 filename
             )
-        except InvalidWheelFilename as exception:
+        except (InvalidWheelFilename, InvalidTag, TooManyTagsError) as exception:
             raise SiteBuildError(
                 f"package returned an invalid wheel filename for {distribution_name}"
             ) from exception
@@ -591,8 +606,12 @@ def _implementation_environment(interpreter: str) -> BaseMarker:
 
 
 def _wheel_python_environment(tag: Tag) -> BaseMarker:
+    if tag.platform == "any" and tag.abi != "none":
+        return EmptyMarker()
     broad_match = _BROAD_PYTHON_TAG_RE.fullmatch(tag.interpreter)
     if broad_match is not None:
+        if tag.abi != "none":
+            return EmptyMarker()
         major = int(broad_match.group(1))
         return MultiMarker.of(
             from_pkg_marker(Marker(f'python_version >= "{major}"')),
@@ -606,7 +625,21 @@ def _wheel_python_environment(tag: Tag) -> BaseMarker:
     major = int(major_text)
     minor = int(minor_text)
     version = f"{major}.{minor}"
+    if interpreter == "cp" and tag.abi not in {"none", "abi3", "abi3t"}:
+        abi_match = _CPYTHON_ABI_RE.fullmatch(tag.abi)
+        if abi_match is None:
+            return EmptyMarker()
+        abi_major, abi_minor, threaded, _debug, pymalloc, ucs4 = abi_match.groups()
+        if (
+            (int(abi_major), int(abi_minor)) != (major, minor)
+            or (threaded and (major, minor) < (3, 13))
+            or (pymalloc and (major, minor) >= (3, 8))
+            or (ucs4 and (major, minor) >= (3, 3))
+        ):
+            return EmptyMarker()
     if interpreter == "py":
+        if tag.abi != "none":
+            return EmptyMarker()
         implementation_environment: BaseMarker = AnyMarker()
     else:
         implementation_environment = _implementation_environment(interpreter)
@@ -615,7 +648,7 @@ def _wheel_python_environment(tag: Tag) -> BaseMarker:
         interpreter != "cp" or (major, minor) < (3, 2)
     ):
         return EmptyMarker()
-    if tag.abi in {"abi3", "abi3t"}:
+    if interpreter == "py" or tag.abi in {"abi3", "abi3t"}:
         version_environment = MultiMarker.of(
             from_pkg_marker(Marker(f'python_version >= "{version}"')),
             from_pkg_marker(Marker(f'python_version < "{major + 1}"')),
@@ -732,18 +765,26 @@ def _platform_tags_overlap(left: str, right: str) -> bool:
     return left_family == right_family
 
 
+@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT)
 def _abi_tags_overlap(left: str, right: str) -> bool:
     if left == "none" or right == "none" or left == right:
         return True
-    stable_abis = {"abi3": "gil", "abi3t": "free-threaded"}
-    left_stable = stable_abis.get(left)
-    right_stable = stable_abis.get(right)
-    left_cpython = re.fullmatch(r"cp[0-9]+(t?)", left)
-    right_cpython = re.fullmatch(r"cp[0-9]+(t?)", right)
-    if left_stable is not None and right_cpython is not None:
-        return (right_cpython.group(1) == "t") == (left_stable == "free-threaded")
-    if right_stable is not None and left_cpython is not None:
-        return (left_cpython.group(1) == "t") == (right_stable == "free-threaded")
+    for runtime_abi, required_abi in ((left, right), (right, left)):
+        match = re.fullmatch(r"cp([0-9])([0-9]+)(t?)(d?)", runtime_abi)
+        if match is None:
+            continue
+        major, minor, _threaded, debug = match.groups()
+        version = (int(major), int(minor))
+        if version[1] > 99:
+            continue
+        abis = [runtime_abi]
+        if debug and version >= (3, 8):
+            abis.append(runtime_abi.removesuffix("d"))
+        if any(
+            tag.abi == required_abi
+            for tag in cpython_tags(version, abis=abis, platforms=("any",))
+        ):
+            return True
     return False
 
 
@@ -779,7 +820,7 @@ def _wheel_sets_overlap(
 ) -> bool:
     applicable = False
     for provider_tag in provider_tags:
-        provider_environment = MultiMarker.of(
+        provider_environment = intersection(
             provider_python_environment,
             condition,
             _wheel_tag_environment(provider_tag),
@@ -790,7 +831,7 @@ def _wheel_sets_overlap(
         for dependency_tag in dependency_tags:
             if not _wheel_tags_overlap(provider_tag, dependency_tag):
                 continue
-            shared_environment = MultiMarker.of(
+            shared_environment = intersection(
                 provider_environment,
                 dependency_python_environment,
                 _wheel_tag_environment(dependency_tag),
@@ -798,6 +839,76 @@ def _wheel_sets_overlap(
             if not shared_environment.is_empty():
                 return True
     return not applicable
+
+
+def _validate_wheel_closure(
+    distribution_name: str,
+    selected_conditions: Mapping[tuple[str, str], BaseMarker],
+    release_python_environments: Mapping[tuple[str, str], BaseMarker],
+    release_wheel_tags: Mapping[tuple[str, str], frozenset[Tag]],
+) -> None:
+    """Find one environment that can install all simultaneously active releases."""
+    releases = sorted(
+        selected_conditions,
+        key=lambda key: (
+            not selected_conditions[key].is_any(),
+            len(release_wheel_tags[key]),
+            key,
+        ),
+    )
+    candidates = {
+        key: tuple(
+            (
+                tag,
+                intersection(
+                    release_python_environments[key], _wheel_tag_environment(tag)
+                ),
+            )
+            for tag in sorted(release_wheel_tags[key], key=str)
+        )
+        for key in releases
+    }
+    remaining_steps = WHEEL_CLOSURE_MAX_STEPS
+
+    def search(
+        offset: int, environment: BaseMarker, selected_tags: tuple[Tag, ...]
+    ) -> bool:
+        nonlocal remaining_steps
+        remaining_steps -= 1
+        if remaining_steps < 0:
+            _fail(f"wheel compatibility search is too complex for {distribution_name}")
+        if environment.is_empty():
+            return False
+        if offset == len(releases):
+            return True
+        key = releases[offset]
+        condition = selected_conditions[key]
+        if not condition.is_any():
+            inactive = intersection(environment, ~condition)
+            if not inactive.is_empty() and search(offset + 1, inactive, selected_tags):
+                return True
+        active = intersection(environment, condition)
+        if active.is_empty():
+            return False
+        for tag, wheel_environment in candidates[key]:
+            remaining_steps -= 1
+            if remaining_steps < 0:
+                _fail(
+                    f"wheel compatibility search is too complex for {distribution_name}"
+                )
+            if not all(
+                _wheel_tags_overlap(tag, selected) for selected in selected_tags
+            ):
+                continue
+            shared = intersection(active, wheel_environment)
+            if not shared.is_empty() and search(
+                offset + 1, shared, (*selected_tags, tag)
+            ):
+                return True
+        return False
+
+    if not search(0, AnyMarker(), ()):
+        _fail(f"{distribution_name} internal wheel closure has no common environment")
 
 
 def _conditioned_requirement(
@@ -1374,6 +1485,12 @@ def _testpypi_install_arguments(
             for child_requirement in release_requirements[selected_key]
         )
 
+    _validate_wheel_closure(
+        distribution_name,
+        selected_conditions,
+        release_python_environments,
+        release_wheel_tags,
+    )
     commands: list[list[str]] = []
     if public_requirements:
         if not isinstance(requires_python, str):

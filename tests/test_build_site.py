@@ -1215,6 +1215,10 @@ class BuildSiteTests(unittest.TestCase):
         incompatible_tags = {
             "version": "cp39-none-manylinux_2_28_x86_64",
             "invalid-stable-ABI": "cp27-abi3-manylinux_2_28_x86_64",
+            "mismatched-interpreter-ABI": "cp310-cp39-manylinux_2_28_x86_64",
+            "unsupported-native-ABI": "cp310-unknown-manylinux_2_28_x86_64",
+            "premature-free-threaded-ABI": "cp310-cp310t-manylinux_2_28_x86_64",
+            "native-ABI-with-universal-platform": "cp310-cp310-any",
         }
 
         for case, wheel_tag in incompatible_tags.items():
@@ -1251,12 +1255,12 @@ class BuildSiteTests(unittest.TestCase):
         distribution = str(manifest["distribution_name"])
         repository = str(manifest["repository"])
         vane_version = "0.2.0.dev1"
-        provider_tag = "cp310-cp310-manylinux_2_28_x86_64"
+        provider_tag = "cp313-cp313-manylinux_2_28_x86_64"
         incompatible_tags = {
-            "python": "cp311-cp311-manylinux_2_28_x86_64",
-            "generic-python": "py311-none-any",
-            "ABI": "cp310-cp310d-manylinux_2_28_x86_64",
-            "platform": "cp310-cp310-win_amd64",
+            "python": "cp314-cp314-manylinux_2_28_x86_64",
+            "generic-python": "py314-none-any",
+            "ABI": "cp313-cp313t-manylinux_2_28_x86_64",
+            "platform": "cp313-cp313-win_amd64",
         }
 
         for dimension, dependency_tag in incompatible_tags.items():
@@ -1313,6 +1317,14 @@ class BuildSiteTests(unittest.TestCase):
                 "py3-none-any",
                 "cp310-cp310-win_amd64",
             ),
+            "generic-forward-compatible": (
+                "cp314-none-manylinux_2_28_x86_64",
+                "py310-none-any",
+            ),
+            "debug-and-release-ABI": (
+                "cp310-cp310d-manylinux_2_28_x86_64",
+                "cp310-cp310-manylinux_2_28_x86_64",
+            ),
         }
 
         for case, (provider_tag, dependency_tag) in compatible_tags.items():
@@ -1348,6 +1360,69 @@ class BuildSiteTests(unittest.TestCase):
                 self.assertIsNotNone(
                     detail["installation"]["posix_install_script"]
                 )
+
+    def test_testpypi_requires_a_common_environment_for_all_internal_wheels(
+        self,
+    ) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        cases = {
+            "disjoint-siblings": ((10,), (11,)),
+            "pairwise-but-not-collectively-compatible": (
+                (10, 11), (11, 12), (10, 12),
+            ),
+            "common-environment": ((10, 11), (11, 12), (11,)),
+        }
+        for case, minor_versions in cases.items():
+            dependencies = {
+                f"vane-extension-dependency-{index}": versions
+                for index, versions in enumerate(minor_versions)
+            }
+            responses = {
+                (
+                    "https://api.github.com/repos/"
+                    f"{repository.removeprefix('https://github.com/')}"
+                ): _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": (
+                    _package_response(
+                        distribution,
+                        requires_dist=[f"{name}===1.0" for name in dependencies],
+                        wheel_tags=("py3-none-any",),
+                    )
+                ),
+                **{
+                    f"https://test.pypi.org/pypi/{name}/1.0/json": (
+                        _release_response(
+                            name,
+                            "1.0",
+                            [],
+                            wheel_tags=tuple(
+                                f"cp3{minor}-none-manylinux_2_28_x86_64"
+                                for minor in versions
+                            ),
+                        )
+                    )
+                    for name, versions in dependencies.items()
+                },
+            }
+            arguments = {
+                "manifest_root": self._single_manifest_root(manifest),
+                "generated_at": GENERATED_AT,
+                "client": _FakeMetadataClient(responses),
+                "public_resolver": _FakePublicDependencyResolver(()),
+            }
+            with self.subTest(case=case):
+                if case == "common-environment":
+                    detail = build_details(**arguments)[0]
+                    self.assertIsNotNone(
+                        detail["installation"]["posix_install_script"]
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        SiteBuildError, "internal wheel closure has no common environment"
+                    ):
+                        build_details(**arguments)
 
     def test_testpypi_ignores_wheel_mismatch_outside_provider_platforms(
         self,
@@ -1406,6 +1481,31 @@ class BuildSiteTests(unittest.TestCase):
         )[0]
 
         self.assertIsNotNone(detail["installation"]["posix_install_script"])
+
+    def test_compressed_wheel_tags_are_bounded_before_filename_parsing(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                distribution, wheel_tags=("py2.py3-none-any",)
+            ),
+        }
+        with (
+            patch("scripts.build_site.PACKAGE_WHEEL_TAGS_MAX_COUNT", 1),
+            patch("scripts.build_site.parse_wheel_filename") as parse_filename,
+            self.assertRaisesRegex(SiteBuildError, "invalid wheel filename"),
+        ):
+            build_details(
+                manifest_root=self._single_manifest_root(manifest),
+                generated_at=GENERATED_AT,
+                client=_FakeMetadataClient(responses),
+            )
+        parse_filename.assert_not_called()
 
     def test_detail_html_escapes_reviewed_text(self) -> None:
         detail = next(

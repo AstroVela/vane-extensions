@@ -82,8 +82,11 @@ different versions are accepted only when their effective conditions do not
 overlap within the provider's `Requires-Python` range. Every selected internal
 release must also support every Python environment in that range where its
 incoming condition is active; an incompatible `Requires-Python` closure fails
-the build. Direct-URL requirements are omitted from published JSON and HTML so
-artifact locations or embedded credentials cannot leak through package metadata.
+the build. A bounded search also requires a common environment for the entire
+internal wheel closure, including the effective conditions of each release;
+pairwise overlap alone is insufficient. Direct-URL requirements are omitted
+from published JSON and HTML so artifact locations or embedded credentials
+cannot leak through package metadata.
 
 For PyPI providers, the same `uv` resolver locks the provider and its complete
 dependency closure together. The registry publishes the installation command
