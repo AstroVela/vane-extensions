@@ -110,13 +110,13 @@
             description.textContent = entry.description;
             command.className = "install";
             const installation = entry.installation;
-            command.textContent = installation.posix_install_commands.length
+            command.textContent = installation.posix_install_script
               ? [
                   "POSIX shell:",
-                  ...installation.posix_install_commands,
+                  installation.posix_install_script,
                   "",
                   "Windows PowerShell:",
-                  ...installation.powershell_install_commands,
+                  installation.powershell_install_script,
                 ].join("\n")
               : "No install command is available until this package is published.";
             facts.className = "facts meta";

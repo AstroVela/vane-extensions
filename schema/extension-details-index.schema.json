@@ -172,29 +172,23 @@
             "type": "object",
             "additionalProperties": false,
             "required": [
-              "posix_install_commands",
-              "powershell_install_commands"
+              "posix_install_script",
+              "powershell_install_script"
             ],
             "properties": {
-              "posix_install_commands": {
-                "type": "array",
-                "maxItems": 2,
-                "uniqueItems": true,
-                "items": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 4096
-                }
+              "posix_install_script": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 16384
               },
-              "powershell_install_commands": {
-                "type": "array",
-                "maxItems": 2,
-                "uniqueItems": true,
-                "items": {
-                  "type": "string",
-                  "minLength": 1,
-                  "maxLength": 4096
-                }
+              "powershell_install_script": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "maxLength": 16384
               }
             }
           }
@@ -222,11 +216,11 @@
               "properties": {
                 "installation": {
                   "properties": {
-                    "posix_install_commands": {
-                      "maxItems": 0
+                    "posix_install_script": {
+                      "type": "null"
                     },
-                    "powershell_install_commands": {
-                      "maxItems": 0
+                    "powershell_install_script": {
+                      "type": "null"
                     }
                   }
                 }
@@ -236,11 +230,13 @@
               "properties": {
                 "installation": {
                   "properties": {
-                    "posix_install_commands": {
-                      "minItems": 1
+                    "posix_install_script": {
+                      "type": "string",
+                      "minLength": 1
                     },
-                    "powershell_install_commands": {
-                      "minItems": 1
+                    "powershell_install_script": {
+                      "type": "string",
+                      "minLength": 1
                     }
                   }
                 }

@@ -60,6 +60,7 @@ VANE_REQUIREMENTS_MAX_COUNT = 64
 PUBLIC_LOCK_MAX_BYTES = 64 * 1024
 PUBLIC_LOCK_MAX_COUNT = 512
 PUBLIC_LOCK_TIMEOUT_SECONDS = 120.0
+INSTALL_SCRIPT_MAX_LENGTH = 16 * 1024
 _PYTHON_TAG_RE = re.compile(r"^(?:cp|pp|py)([0-9])([0-9]+)$")
 _UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
@@ -904,8 +905,13 @@ def _pip_install_arguments(
     ]
 
 
-def _posix_install_command(arguments: list[str]) -> str:
-    return shlex.join(["env", "PIP_CONFIG_FILE=/dev/null", *arguments])
+def _posix_install_script(commands: list[list[str]]) -> str | None:
+    if not commands:
+        return None
+    return " &&\n".join(
+        shlex.join(["env", "PIP_CONFIG_FILE=/dev/null", *arguments])
+        for arguments in commands
+    )
 
 
 def _powershell_quote(argument: str) -> str:
@@ -914,11 +920,46 @@ def _powershell_quote(argument: str) -> str:
     return f"'{escaped}'"
 
 
-def _powershell_install_command(arguments: list[str]) -> str:
-    quoted_arguments = " ".join(
-        _powershell_quote(argument) for argument in arguments
+def _powershell_install_script(commands: list[list[str]]) -> str | None:
+    if not commands:
+        return None
+    lines = [
+        "& {",
+        "  $__vanePipConfigFileWasSet = Test-Path Env:PIP_CONFIG_FILE",
+        "  $__vanePipConfigFile = $env:PIP_CONFIG_FILE",
+        "  try {",
+        "    $env:PIP_CONFIG_FILE = 'NUL'",
+    ]
+    for arguments in commands:
+        quoted_arguments = " ".join(
+            _powershell_quote(argument) for argument in arguments
+        )
+        lines.extend(
+            [
+                f"    & {quoted_arguments}",
+                "    $__vanePipSucceeded = $?",
+                "    $__vanePipExitCode = $LASTEXITCODE",
+                (
+                    "    if (-not $__vanePipSucceeded -or "
+                    "$__vanePipExitCode -ne 0) {"
+                ),
+                '      throw "pip exited with code $__vanePipExitCode"',
+                "    }",
+            ]
+        )
+    lines.extend(
+        [
+            "  } finally {",
+            "    if ($__vanePipConfigFileWasSet) {",
+            "      $env:PIP_CONFIG_FILE = $__vanePipConfigFile",
+            "    } else {",
+            "      Remove-Item Env:PIP_CONFIG_FILE -ErrorAction SilentlyContinue",
+            "    }",
+            "  }",
+            "}",
+        ]
     )
-    return f"$env:PIP_CONFIG_FILE = 'NUL'; & {quoted_arguments}"
+    return "\n".join(lines)
 
 
 def _testpypi_install_arguments(
@@ -1151,25 +1192,22 @@ def _installation_metadata(
                 public_resolver,
             )
         ]
-    posix_install_commands = [
-        _posix_install_command(arguments) for arguments in install_arguments
-    ]
-    powershell_install_commands = [
-        _powershell_install_command(arguments) for arguments in install_arguments
-    ]
+    posix_install_script = _posix_install_script(install_arguments)
+    powershell_install_script = _powershell_install_script(install_arguments)
     if any(
-        len(command) > 4096
-        for command in (*posix_install_commands, *powershell_install_commands)
+        len(script) > INSTALL_SCRIPT_MAX_LENGTH
+        for script in (posix_install_script, powershell_install_script)
+        if script is not None
     ):
-        _fail(f"generated install command is too long for {distribution_name}")
+        _fail(f"generated install script is too long for {distribution_name}")
     load_example = (
         "import vane\n\n"
         'connection = vane.connect(\":memory:\")\n'
         f'vane.load_installed_extension("{extension_name}", connection=connection)'
     )
     return {
-        "posix_install_commands": posix_install_commands,
-        "powershell_install_commands": powershell_install_commands,
+        "posix_install_script": posix_install_script,
+        "powershell_install_script": powershell_install_script,
         "load_example": load_example,
     }
 
@@ -1287,10 +1325,8 @@ def _summary_record(detail: Mapping[str, object]) -> dict[str, object]:
             )
         },
         "installation": {
-            "posix_install_commands": installation["posix_install_commands"],
-            "powershell_install_commands": installation[
-                "powershell_install_commands"
-            ],
+            "posix_install_script": installation["posix_install_script"],
+            "powershell_install_script": installation["powershell_install_script"],
         },
     }
 
