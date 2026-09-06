@@ -300,8 +300,17 @@ def _package_response(
     *,
     requires_dist: list[str] | None = None,
     requires_python: str | None = ">=3.10,<3.15",
+    wheel_tags: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     wheel_distribution = distribution_name.replace("-", "_")
+    selected_wheel_tags = (
+        wheel_tags
+        if wheel_tags is not None
+        else (
+            "cp310-none-manylinux_2_28_x86_64",
+            "cp314-none-manylinux_2_28_x86_64",
+        )
+    )
     return {
         "info": {
             "name": distribution_name,
@@ -310,30 +319,33 @@ def _package_response(
             "requires_dist": requires_dist or [],
         },
         "urls": [
-            {
-                "packagetype": "bdist_wheel",
-                "yanked": False,
-                "filename": (
-                    f"{wheel_distribution}-{version}-cp310-none-"
-                    "manylinux_2_28_x86_64.whl"
-                ),
-                "upload_time_iso_8601": "2026-09-02T11:00:00Z",
-                "url": "https://files.example/artifact.whl",
-                "digests": {"sha256": "not-published-by-the-registry"},
-            },
-            {
-                "packagetype": "bdist_wheel",
-                "yanked": False,
-                "filename": (
-                    f"{wheel_distribution}-{version}-cp314-none-"
-                    "manylinux_2_28_x86_64.whl"
-                ),
-                "upload_time_iso_8601": "2026-09-02T11:01:00Z",
-            },
+            *[
+                {
+                    "packagetype": "bdist_wheel",
+                    "yanked": False,
+                    "filename": f"{wheel_distribution}-{version}-{wheel_tag}.whl",
+                    "upload_time_iso_8601": (
+                        f"2026-09-02T11:{index:02d}:00Z"
+                    ),
+                    **(
+                        {
+                            "url": "https://files.example/artifact.whl",
+                            "digests": {
+                                "sha256": "not-published-by-the-registry"
+                            },
+                        }
+                        if index == 0
+                        else {}
+                    ),
+                }
+                for index, wheel_tag in enumerate(selected_wheel_tags)
+            ],
             {
                 "packagetype": "sdist",
                 "yanked": False,
-                "upload_time_iso_8601": "2026-09-02T11:02:00Z",
+                "upload_time_iso_8601": (
+                    f"2026-09-02T11:{len(selected_wheel_tags):02d}:00Z"
+                ),
             },
         ],
     }
@@ -345,12 +357,14 @@ def _release_response(
     requires_dist: list[str],
     *,
     requires_python: str | None = ">=3.10,<3.15",
+    wheel_tags: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
     return _package_response(
         distribution_name,
         version,
         requires_dist=requires_dist,
         requires_python=requires_python,
+        wheel_tags=wheel_tags,
     )
 
 
@@ -1193,6 +1207,205 @@ class BuildSiteTests(unittest.TestCase):
                     generated_at=GENERATED_AT,
                     client=_FakeMetadataClient(responses),
                 )
+
+    def test_testpypi_provider_wheel_must_match_requires_python(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        incompatible_tags = {
+            "version": "cp39-none-manylinux_2_28_x86_64",
+            "invalid-stable-ABI": "cp27-abi3-manylinux_2_28_x86_64",
+        }
+
+        for case, wheel_tag in incompatible_tags.items():
+            responses = {
+                (
+                    "https://api.github.com/repos/"
+                    f"{repository.removeprefix('https://github.com/')}"
+                ): _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": (
+                    _package_response(
+                        distribution,
+                        requires_python=">=3.10,<3.15",
+                        wheel_tags=(wheel_tag,),
+                    )
+                ),
+            }
+
+            with (
+                self.subTest(case=case),
+                self.assertRaisesRegex(
+                    SiteBuildError,
+                    "wheel compatible with its Requires-Python",
+                ),
+            ):
+                build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=_FakeMetadataClient(responses),
+                    public_resolver=_FakePublicDependencyResolver(()),
+                )
+
+    def test_testpypi_rejects_disjoint_internal_wheel_environments(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        vane_version = "0.2.0.dev1"
+        provider_tag = "cp310-cp310-manylinux_2_28_x86_64"
+        incompatible_tags = {
+            "python": "cp311-cp311-manylinux_2_28_x86_64",
+            "generic-python": "py311-none-any",
+            "ABI": "cp310-cp310d-manylinux_2_28_x86_64",
+            "platform": "cp310-cp310-win_amd64",
+        }
+
+        for dimension, dependency_tag in incompatible_tags.items():
+            responses = {
+                (
+                    "https://api.github.com/repos/"
+                    f"{repository.removeprefix('https://github.com/')}"
+                ): _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": (
+                    _package_response(
+                        distribution,
+                        requires_dist=[f"vane-ai==={vane_version}"],
+                        wheel_tags=(provider_tag,),
+                    )
+                ),
+                f"https://test.pypi.org/pypi/vane-ai/{vane_version}/json": (
+                    _release_response(
+                        "vane-ai",
+                        vane_version,
+                        [],
+                        wheel_tags=(dependency_tag,),
+                    )
+                ),
+            }
+
+            with (
+                self.subTest(dimension=dimension),
+                self.assertRaisesRegex(
+                    SiteBuildError, "has no non-yanked wheel compatible"
+                ),
+            ):
+                build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=_FakeMetadataClient(responses),
+                    public_resolver=_FakePublicDependencyResolver(()),
+                )
+
+    def test_testpypi_accepts_standard_compatible_wheel_tags(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        vane_version = "0.2.0.dev1"
+        compatible_tags = {
+            "abi-none": (
+                "cp310-none-manylinux_2_28_x86_64",
+                "cp310-cp310-manylinux_2_28_x86_64",
+            ),
+            "stable-abi": (
+                "cp314-cp314-manylinux_2_28_x86_64",
+                "cp310-abi3-manylinux_2_28_x86_64",
+            ),
+            "universal": (
+                "py3-none-any",
+                "cp310-cp310-win_amd64",
+            ),
+        }
+
+        for case, (provider_tag, dependency_tag) in compatible_tags.items():
+            responses = {
+                (
+                    "https://api.github.com/repos/"
+                    f"{repository.removeprefix('https://github.com/')}"
+                ): _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": (
+                    _package_response(
+                        distribution,
+                        requires_dist=[f"vane-ai==={vane_version}"],
+                        wheel_tags=(provider_tag,),
+                    )
+                ),
+                f"https://test.pypi.org/pypi/vane-ai/{vane_version}/json": (
+                    _release_response(
+                        "vane-ai",
+                        vane_version,
+                        [],
+                        wheel_tags=(dependency_tag,),
+                    )
+                ),
+            }
+
+            with self.subTest(case=case):
+                detail = build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=_FakeMetadataClient(responses),
+                    public_resolver=_FakePublicDependencyResolver(()),
+                )[0]
+                self.assertIsNotNone(
+                    detail["installation"]["posix_install_script"]
+                )
+
+    def test_testpypi_ignores_wheel_mismatch_outside_provider_platforms(
+        self,
+    ) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        windows_version = "0.2.0.dev1"
+        linux_version = "0.2.0"
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": (
+                _package_response(
+                    distribution,
+                    requires_dist=[
+                        (
+                            f"vane-ai==={windows_version}; "
+                            'sys_platform == "win32"'
+                        ),
+                        f"vane-extension-avro==={linux_version}",
+                    ],
+                    wheel_tags=(
+                        "cp310-none-manylinux_2_28_x86_64",
+                    ),
+                )
+            ),
+            f"https://test.pypi.org/pypi/vane-ai/{windows_version}/json": (
+                _release_response(
+                    "vane-ai",
+                    windows_version,
+                    [],
+                    wheel_tags=("cp310-cp310-win_amd64",),
+                )
+            ),
+            (
+                "https://test.pypi.org/pypi/"
+                f"vane-extension-avro/{linux_version}/json"
+            ): _release_response(
+                "vane-extension-avro",
+                linux_version,
+                [],
+                wheel_tags=(
+                    "cp310-none-manylinux_2_28_x86_64",
+                ),
+            ),
+        }
+
+        detail = build_details(
+            manifest_root=self._single_manifest_root(manifest),
+            generated_at=GENERATED_AT,
+            client=_FakeMetadataClient(responses),
+            public_resolver=_FakePublicDependencyResolver(()),
+        )[0]
+
+        self.assertIsNotNone(detail["installation"]["posix_install_script"])
 
     def test_detail_html_escapes_reviewed_text(self) -> None:
         detail = next(

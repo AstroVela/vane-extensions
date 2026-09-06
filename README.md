@@ -69,20 +69,21 @@ closure from PyPI with dependency resolution disabled before installing the
 exact Vane and extension wheels from TestPyPI the same way. Both steps force
 reinstallation so a matching distribution already present from another source
 cannot satisfy either step.
-The site build fails closed unless the provider and every selected Vane-owned
-dependency publish at least one non-yanked wheel, or if the public closure
-contains a Vane-owned package. The registry never emits `--extra-index-url`,
-because pip gives no priority to the primary index and that pattern is
-vulnerable to dependency confusion. PEP 508 requirements and wheel filenames
-are parsed by `packaging`; `dep-logic` reduces compound extra markers without
-tying recipes to the build machine. Conditions on exact Vane-owned dependencies
-are preserved and propagated through their dependency graph; different versions
-are accepted only when their effective conditions do not overlap within the
-provider's `Requires-Python` range. Every selected internal release must also
-support every Python environment in that range where its incoming condition is
-active; an incompatible `Requires-Python` closure fails the build. Direct-URL
-requirements are omitted from published JSON and HTML so artifact locations or
-embedded credentials cannot leak through package metadata.
+The site build fails closed if the provider or any selected Vane-owned
+dependency lacks a non-yanked wheel, if an applicable internal release shares no
+Python, ABI, and platform environment with a provider wheel, or if the public
+closure contains a Vane-owned package. The registry never emits
+`--extra-index-url`, because pip gives no priority to the primary index and that
+pattern is vulnerable to dependency confusion. PEP 508 requirements and wheel
+filenames are parsed by `packaging`; `dep-logic` reduces compound extra markers
+without tying recipes to the build machine. Conditions on exact Vane-owned
+dependencies are preserved and propagated through their dependency graph;
+different versions are accepted only when their effective conditions do not
+overlap within the provider's `Requires-Python` range. Every selected internal
+release must also support every Python environment in that range where its
+incoming condition is active; an incompatible `Requires-Python` closure fails
+the build. Direct-URL requirements are omitted from published JSON and HTML so
+artifact locations or embedded credentials cannot leak through package metadata.
 
 For PyPI providers, the same `uv` resolver locks the provider and its complete
 dependency closure together. The registry publishes the installation command

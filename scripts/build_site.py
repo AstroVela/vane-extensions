@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import copy
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from threading import Lock
 from typing import NoReturn, Protocol
@@ -35,6 +36,7 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from packaging.markers import Marker
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.tags import Tag, mac_platforms
 from packaging.utils import (
     InvalidWheelFilename,
     canonicalize_name,
@@ -56,12 +58,22 @@ REMOTE_METADATA_MAX_BYTES = 8 * 1024 * 1024
 REMOTE_METADATA_TIMEOUT_SECONDS = 15.0
 METADATA_MAX_WORKERS = 16
 PACKAGE_REQUIREMENTS_MAX_COUNT = 256
+PACKAGE_WHEEL_TAGS_MAX_COUNT = 512
 VANE_REQUIREMENTS_MAX_COUNT = 64
 PUBLIC_LOCK_MAX_BYTES = 64 * 1024
 PUBLIC_LOCK_MAX_COUNT = 512
 PUBLIC_LOCK_TIMEOUT_SECONDS = 120.0
 INSTALL_SCRIPT_MAX_LENGTH = 16 * 1024
-_PYTHON_TAG_RE = re.compile(r"^(?:cp|pp|py)([0-9])([0-9]+)$")
+_PYTHON_TAG_RE = re.compile(r"^(cp|pp|py)([0-9])([0-9]+)$")
+_BROAD_PYTHON_TAG_RE = re.compile(r"^py([0-9])$")
+_VERSIONED_INTERPRETER_TAG_RE = re.compile(
+    r"^([a-z][a-z0-9_]*?)([0-9])([0-9]+)$"
+)
+_LINUX_PLATFORM_RE = re.compile(
+    r"^(manylinux(?:_[0-9]+_[0-9]+|1|2010|2014)|"
+    r"musllinux_[0-9]+_[0-9]+|linux)_(.+)$"
+)
+_MACOS_PLATFORM_RE = re.compile(r"^macosx_([0-9]+)_([0-9]+)_(.+)$")
 _UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
@@ -266,7 +278,7 @@ def _python_version_from_tag(interpreter: str) -> str | None:
     match = _PYTHON_TAG_RE.fullmatch(interpreter)
     if match is None:
         return None
-    return f"{match.group(1)}.{int(match.group(2))}"
+    return f"{match.group(2)}.{int(match.group(3))}"
 
 
 def _package_requirements(
@@ -301,7 +313,7 @@ def _package_file_metadata(
     distribution_name: str,
     version_text: str,
     version: Version,
-) -> dict[str, object]:
+) -> tuple[dict[str, object], frozenset[Tag]]:
     raw_files = document.get("urls")
     if not isinstance(raw_files, list):
         _fail(f"package urls must be a list for {distribution_name}")
@@ -310,6 +322,7 @@ def _package_file_metadata(
     python_tags: set[str] = set()
     abi_tags: set[str] = set()
     platform_tags: set[str] = set()
+    available_wheel_tags: set[Tag] = set()
     upload_times: list[tuple[datetime, str]] = []
     for raw_file in raw_files:
         package_file = _mapping(raw_file, f"package file for {distribution_name}")
@@ -337,7 +350,7 @@ def _package_file_metadata(
         if not isinstance(filename, str):
             _fail(f"package filename is missing for {distribution_name}")
         try:
-            wheel_name, wheel_version, _build, wheel_tags = parse_wheel_filename(
+            wheel_name, wheel_version, _build, parsed_tags = parse_wheel_filename(
                 filename
             )
         except InvalidWheelFilename as exception:
@@ -350,7 +363,10 @@ def _package_file_metadata(
         ):
             _fail(f"wheel identity does not match {distribution_name}=={version_text}")
         wheel_count += 1
-        for tag in wheel_tags:
+        available_wheel_tags.update(parsed_tags)
+        if len(available_wheel_tags) > PACKAGE_WHEEL_TAGS_MAX_COUNT:
+            _fail(f"package has too many wheel tags for {distribution_name}")
+        for tag in parsed_tags:
             python_tags.add(tag.interpreter)
             abi_tags.add(tag.abi)
             platform_tags.add(tag.platform)
@@ -361,19 +377,22 @@ def _package_file_metadata(
     latest_release_uploaded_at = (
         max(upload_times, key=lambda item: item[0])[1] if upload_times else None
     )
-    return {
-        "wheel_count": wheel_count,
-        "python_versions": sorted(python_versions, key=Version),
-        "python_tags": sorted(python_tags),
-        "abi_tags": sorted(abi_tags),
-        "platform_tags": sorted(platform_tags),
-        "latest_release_uploaded_at": latest_release_uploaded_at,
-    }
+    return (
+        {
+            "wheel_count": wheel_count,
+            "python_versions": sorted(python_versions, key=Version),
+            "python_tags": sorted(python_tags),
+            "abi_tags": sorted(abi_tags),
+            "platform_tags": sorted(platform_tags),
+            "latest_release_uploaded_at": latest_release_uploaded_at,
+        },
+        frozenset(available_wheel_tags),
+    )
 
 
 def _package_metadata(
     distribution_name: str, package_index: str, client: JsonMetadataClient
-) -> tuple[dict[str, object], tuple[Requirement, ...]]:
+) -> tuple[dict[str, object], tuple[Requirement, ...], frozenset[Tag]]:
     index = _PACKAGE_INDEXES[package_index]
     escaped_distribution = quote(distribution_name, safe="-")
     api_url = index["api"].format(distribution=escaped_distribution)
@@ -396,6 +415,7 @@ def _package_metadata(
                 "latest_release_uploaded_at": None,
             },
             (),
+            frozenset(),
         )
 
     document = _mapping(value, f"package metadata for {distribution_name}")
@@ -427,7 +447,7 @@ def _package_metadata(
                 f"package Requires-Python is invalid for {distribution_name}"
             ) from exception
     requirements = _package_requirements(info, distribution_name)
-    file_metadata = _package_file_metadata(
+    file_metadata, wheel_tags = _package_file_metadata(
         document, distribution_name, version_text, latest_version
     )
     return (
@@ -445,6 +465,7 @@ def _package_metadata(
             **file_metadata,
         },
         requirements,
+        wheel_tags,
     )
 
 
@@ -541,6 +562,242 @@ def _python_environment_marker(
     if environment.is_empty():
         _fail(f"package Requires-Python is empty for {distribution_name}")
     return environment
+
+
+def _equals_marker(name: str, value: str) -> BaseMarker:
+    return from_pkg_marker(Marker(f"{name} == {json.dumps(value)}"))
+
+
+def _one_of_marker(name: str, values: frozenset[str]) -> BaseMarker:
+    return MarkerUnion.of(*(_equals_marker(name, value) for value in values))
+
+
+def _implementation_environment(interpreter: str) -> BaseMarker:
+    implementations = {
+        "cp": ("cpython", "CPython"),
+        "graalpy": ("graalpy", "GraalPy"),
+        "ip": ("ironpython", "IronPython"),
+        "jy": ("jython", "Jython"),
+        "pp": ("pypy", "PyPy"),
+    }
+    names = implementations.get(interpreter)
+    if names is None:
+        return _equals_marker("implementation_name", interpreter)
+    implementation_name, display_name = names
+    return MultiMarker.of(
+        _equals_marker("implementation_name", implementation_name),
+        _equals_marker("platform_python_implementation", display_name),
+    )
+
+
+def _wheel_python_environment(tag: Tag) -> BaseMarker:
+    broad_match = _BROAD_PYTHON_TAG_RE.fullmatch(tag.interpreter)
+    if broad_match is not None:
+        major = int(broad_match.group(1))
+        return MultiMarker.of(
+            from_pkg_marker(Marker(f'python_version >= "{major}"')),
+            from_pkg_marker(Marker(f'python_version < "{major + 1}"')),
+        )
+
+    versioned_match = _VERSIONED_INTERPRETER_TAG_RE.fullmatch(tag.interpreter)
+    if versioned_match is None:
+        return EmptyMarker()
+    interpreter, major_text, minor_text = versioned_match.groups()
+    major = int(major_text)
+    minor = int(minor_text)
+    version = f"{major}.{minor}"
+    if interpreter == "py":
+        implementation_environment: BaseMarker = AnyMarker()
+    else:
+        implementation_environment = _implementation_environment(interpreter)
+
+    if tag.abi in {"abi3", "abi3t"} and (
+        interpreter != "cp" or (major, minor) < (3, 2)
+    ):
+        return EmptyMarker()
+    if tag.abi in {"abi3", "abi3t"}:
+        version_environment = MultiMarker.of(
+            from_pkg_marker(Marker(f'python_version >= "{version}"')),
+            from_pkg_marker(Marker(f'python_version < "{major + 1}"')),
+        )
+    else:
+        version_environment = from_pkg_marker(
+            Marker(f'python_version == "{version}"')
+        )
+    return MultiMarker.of(implementation_environment, version_environment)
+
+
+def _operating_system_environment(system: str) -> BaseMarker:
+    values = {
+        "linux": ("posix", "linux", "Linux"),
+        "macos": ("posix", "darwin", "Darwin"),
+        "windows": ("nt", "win32", "Windows"),
+    }
+    os_name, sys_platform, platform_system = values[system]
+    return MultiMarker.of(
+        _equals_marker("os_name", os_name),
+        _equals_marker("sys_platform", sys_platform),
+        _equals_marker("platform_system", platform_system),
+    )
+
+
+@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT)
+def _macos_architectures(platform_tag: str) -> frozenset[str]:
+    match = _MACOS_PLATFORM_RE.fullmatch(platform_tag)
+    if match is None:
+        return frozenset()
+    major, minor, wheel_architecture = match.groups()
+    major_version = int(major)
+    minor_version = int(minor)
+    if major_version > 99 or minor_version > 99:
+        return frozenset()
+    target_version = (
+        max(major_version, 11),
+        0 if major_version >= 11 else minor_version,
+    )
+    architectures = frozenset(
+        architecture
+        for architecture in ("arm64", "x86_64")
+        if platform_tag in set(mac_platforms(target_version, architecture))
+    )
+    if architectures:
+        return architectures
+    if wheel_architecture in {"arm64", "x86_64"}:
+        return frozenset((wheel_architecture,))
+    return frozenset()
+
+
+def _platform_shape(platform_tag: str) -> tuple[str, frozenset[str]]:
+    if platform_tag == "any":
+        return "any", frozenset()
+    linux_match = _LINUX_PLATFORM_RE.fullmatch(platform_tag)
+    if linux_match is not None:
+        policy, architecture = linux_match.groups()
+        if policy.startswith("manylinux"):
+            family = "linux-glibc"
+        elif policy.startswith("musllinux"):
+            family = "linux-musl"
+        else:
+            family = "linux-any"
+        return family, frozenset((architecture,))
+    if platform_tag == "win32":
+        return "windows", frozenset(("x86",))
+    if platform_tag.startswith("win_"):
+        architecture = platform_tag.removeprefix("win_")
+        machine = {"amd64": "AMD64", "arm64": "ARM64"}.get(
+            architecture, architecture
+        )
+        return "windows", frozenset((machine,))
+    macos_architectures = _macos_architectures(platform_tag)
+    if macos_architectures:
+        return "macos", macos_architectures
+    return f"exact:{platform_tag}", frozenset()
+
+
+def _wheel_platform_environment(platform_tag: str) -> BaseMarker:
+    family, architectures = _platform_shape(platform_tag)
+    if family == "any":
+        return AnyMarker()
+    if family.startswith("linux-"):
+        operating_system = _operating_system_environment("linux")
+    elif family == "windows":
+        operating_system = _operating_system_environment("windows")
+    elif family == "macos":
+        operating_system = _operating_system_environment("macos")
+    else:
+        return EmptyMarker()
+    machine_environment = (
+        _one_of_marker("platform_machine", architectures)
+        if architectures
+        else AnyMarker()
+    )
+    return MultiMarker.of(operating_system, machine_environment)
+
+
+def _platform_tags_overlap(left: str, right: str) -> bool:
+    left_family, left_architectures = _platform_shape(left)
+    right_family, right_architectures = _platform_shape(right)
+    if "any" in {left_family, right_family}:
+        return True
+    if left_family.startswith("linux-") and right_family.startswith("linux-"):
+        libc_compatible = (
+            left_family == right_family
+            or "linux-any" in {left_family, right_family}
+        )
+        return libc_compatible and bool(left_architectures & right_architectures)
+    if left_family != right_family:
+        return False
+    if left_family in {"windows", "macos"}:
+        return bool(left_architectures & right_architectures)
+    return left_family == right_family
+
+
+def _abi_tags_overlap(left: str, right: str) -> bool:
+    if left == "none" or right == "none" or left == right:
+        return True
+    stable_abis = {"abi3": "gil", "abi3t": "free-threaded"}
+    left_stable = stable_abis.get(left)
+    right_stable = stable_abis.get(right)
+    left_cpython = re.fullmatch(r"cp[0-9]+(t?)", left)
+    right_cpython = re.fullmatch(r"cp[0-9]+(t?)", right)
+    if left_stable is not None and right_cpython is not None:
+        return (right_cpython.group(1) == "t") == (left_stable == "free-threaded")
+    if right_stable is not None and left_cpython is not None:
+        return (left_cpython.group(1) == "t") == (right_stable == "free-threaded")
+    return False
+
+
+def _wheel_tag_environment(tag: Tag) -> BaseMarker:
+    return MultiMarker.of(
+        _wheel_python_environment(tag),
+        _wheel_platform_environment(tag.platform),
+    )
+
+
+def _wheel_tags_overlap(left: Tag, right: Tag) -> bool:
+    return _abi_tags_overlap(left.abi, right.abi) and _platform_tags_overlap(
+        left.platform, right.platform
+    )
+
+
+def _wheel_set_matches_environment(
+    wheel_tags: frozenset[Tag], environment: BaseMarker
+) -> bool:
+    return any(
+        not MultiMarker.of(environment, _wheel_tag_environment(tag)).is_empty()
+        for tag in wheel_tags
+    )
+
+
+def _wheel_sets_overlap(
+    provider_tags: frozenset[Tag],
+    dependency_tags: frozenset[Tag],
+    *,
+    provider_python_environment: BaseMarker,
+    dependency_python_environment: BaseMarker,
+    condition: BaseMarker,
+) -> bool:
+    applicable = False
+    for provider_tag in provider_tags:
+        provider_environment = MultiMarker.of(
+            provider_python_environment,
+            condition,
+            _wheel_tag_environment(provider_tag),
+        )
+        if provider_environment.is_empty():
+            continue
+        applicable = True
+        for dependency_tag in dependency_tags:
+            if not _wheel_tags_overlap(provider_tag, dependency_tag):
+                continue
+            shared_environment = MultiMarker.of(
+                provider_environment,
+                dependency_python_environment,
+                _wheel_tag_environment(dependency_tag),
+            )
+            if not shared_environment.is_empty():
+                return True
+    return not applicable
 
 
 def _conditioned_requirement(
@@ -836,7 +1093,7 @@ def _release_requirements(
     parent_distribution: str,
     package_index: str,
     client: JsonMetadataClient,
-) -> tuple[str, BaseMarker, tuple[Requirement, ...]]:
+) -> tuple[str, BaseMarker, tuple[Requirement, ...], frozenset[Tag]]:
     distribution_name, requested_version = _exact_internal_requirement(
         requirement, parent_distribution
     )
@@ -870,7 +1127,7 @@ def _release_requirements(
         _fail(
             f"package release metadata identity does not match {requirement}"
         )
-    file_metadata = _package_file_metadata(
+    file_metadata, wheel_tags = _package_file_metadata(
         document, distribution_name, reported_version, release_version
     )
     if file_metadata["wheel_count"] == 0:
@@ -883,10 +1140,18 @@ def _release_requirements(
     python_environment = _python_environment_marker(
         requires_python, distribution_name
     )
+    if not _wheel_set_matches_environment(
+        wheel_tags, python_environment
+    ):
+        _fail(
+            f"{distribution_name} has no non-yanked wheel compatible with "
+            "its Requires-Python"
+        )
     return (
         reported_version,
         python_environment,
         _package_requirements(info, distribution_name),
+        wheel_tags,
     )
 
 
@@ -967,6 +1232,7 @@ def _testpypi_install_arguments(
     version_text: str,
     requires_python: object,
     requirements: tuple[Requirement, ...],
+    provider_wheel_tags: frozenset[Tag],
     client: JsonMetadataClient,
     public_resolver: PublicDependencyResolver,
 ) -> list[list[str]]:
@@ -974,6 +1240,13 @@ def _testpypi_install_arguments(
     python_environment = _python_environment_marker(
         requires_python, distribution_name
     )
+    if not _wheel_set_matches_environment(
+        provider_wheel_tags, python_environment
+    ):
+        _fail(
+            f"{distribution_name} has no non-yanked wheel compatible with "
+            "its Requires-Python"
+        )
     root_key = (root_name, version_text)
     selected_conditions: dict[tuple[str, str], BaseMarker] = {
         root_key: AnyMarker()
@@ -983,6 +1256,9 @@ def _testpypi_install_arguments(
     ] = {root_key: requirements}
     release_python_environments: dict[tuple[str, str], BaseMarker] = {
         root_key: python_environment
+    }
+    release_wheel_tags: dict[tuple[str, str], frozenset[Tag]] = {
+        root_key: provider_wheel_tags
     }
     release_aliases: dict[tuple[str, str], tuple[str, str]] = {}
     pending = [(requirement, AnyMarker()) for requirement in requirements]
@@ -1030,6 +1306,7 @@ def _testpypi_install_arguments(
                     reported_version,
                     child_python_environment,
                     child_requirements,
+                    child_wheel_tags,
                 ) = _release_requirements(
                     requirement,
                     parent_distribution=distribution_name,
@@ -1044,6 +1321,7 @@ def _testpypi_install_arguments(
                 release_python_environments.setdefault(
                     selected_key, child_python_environment
                 )
+                release_wheel_tags.setdefault(selected_key, child_wheel_tags)
 
         dependency_python_environment = release_python_environments[selected_key]
         unsupported_environment = MultiMarker.of(
@@ -1056,7 +1334,17 @@ def _testpypi_install_arguments(
                 f"{dependency_name}=={selected_key[1]} Requires-Python is "
                 f"incompatible with {distribution_name}"
             )
-
+        if not _wheel_sets_overlap(
+            provider_wheel_tags,
+            release_wheel_tags[selected_key],
+            provider_python_environment=python_environment,
+            dependency_python_environment=dependency_python_environment,
+            condition=condition,
+        ):
+            _fail(
+                f"{dependency_name}=={selected_key[1]} has no non-yanked wheel "
+                f"compatible with {distribution_name}"
+            )
         for other_key, other_condition in selected_conditions.items():
             if (
                 other_key[0] == dependency_name
@@ -1164,6 +1452,7 @@ def _installation_metadata(
     package_index: str,
     package: Mapping[str, object],
     requirements: tuple[Requirement, ...],
+    provider_wheel_tags: frozenset[Tag],
     client: JsonMetadataClient,
     public_resolver: PublicDependencyResolver,
 ) -> dict[str, object]:
@@ -1180,6 +1469,7 @@ def _installation_metadata(
             version_text,
             package["requires_python"],
             requirements,
+            provider_wheel_tags,
             client,
             public_resolver,
         )
@@ -1224,7 +1514,7 @@ def _detail_record(
     distribution_name = str(manifest["distribution_name"])
     repository = str(manifest["repository"])
     package_index = str(manifest["package_index"])
-    package, requirements = _package_metadata(
+    package, requirements, provider_wheel_tags = _package_metadata(
         distribution_name, package_index, client
     )
     metrics = _download_metadata(
@@ -1250,6 +1540,7 @@ def _detail_record(
             package_index,
             package,
             requirements,
+            provider_wheel_tags,
             client,
             public_resolver,
         ),
