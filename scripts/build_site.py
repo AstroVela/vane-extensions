@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -114,7 +115,7 @@ class JsonMetadataClient(Protocol):
 
 
 class PublicDependencyResolver(Protocol):
-    """Resolve public requirements without consulting a Vane package index."""
+    """Resolve an exact wheel closure from the public PyPI index."""
 
     def resolve(
         self,
@@ -122,6 +123,7 @@ class PublicDependencyResolver(Protocol):
         *,
         requires_python: str,
         distribution_name: str,
+        reject_vane: bool,
     ) -> tuple[str, ...]: ...
 
 
@@ -514,8 +516,86 @@ def _requirement_for_base_install(requirement: Requirement) -> Requirement | Non
         ) from exception
 
 
+def _python_environment_marker(
+    requires_python: object, distribution_name: str
+) -> BaseMarker:
+    if requires_python is None:
+        return AnyMarker()
+    if not isinstance(requires_python, str):
+        _fail(f"package Requires-Python is invalid for {distribution_name}")
+    try:
+        specifiers = SpecifierSet(requires_python)
+        markers = tuple(
+            from_pkg_marker(
+                Marker(
+                    f'python_full_version {specifier.operator} '
+                    f'"{specifier.version}"'
+                )
+            )
+            for specifier in specifiers
+        )
+        environment = MultiMarker.of(*markers) if markers else AnyMarker()
+    except (KeyError, TypeError, ValueError) as exception:
+        raise SiteBuildError(
+            f"package Requires-Python is invalid for {distribution_name}"
+        ) from exception
+    if environment.is_empty():
+        _fail(f"package Requires-Python is empty for {distribution_name}")
+    return environment
+
+
+def _conditioned_requirement(
+    requirement: Requirement,
+    inherited_condition: BaseMarker,
+    python_environment: BaseMarker,
+    distribution_name: str,
+) -> tuple[Requirement, BaseMarker] | None:
+    base_requirement = _requirement_for_base_install(requirement)
+    if base_requirement is None:
+        return None
+    try:
+        own_condition = (
+            AnyMarker()
+            if base_requirement.marker is None
+            else from_pkg_marker(base_requirement.marker)
+        )
+        condition = MultiMarker.of(inherited_condition, own_condition)
+        if MultiMarker.of(python_environment, condition).is_empty():
+            return None
+        conditioned = copy(base_requirement)
+        conditioned.marker = None
+        return conditioned, condition
+    except (KeyError, TypeError, ValueError) as exception:
+        raise SiteBuildError(
+            f"package marker cannot be combined for {distribution_name}"
+        ) from exception
+
+
+def _requirement_with_condition(
+    requirement: Requirement, condition: BaseMarker
+) -> str:
+    conditioned = copy(requirement)
+    conditioned.marker = None if condition.is_any() else Marker(str(condition))
+    return str(conditioned)
+
+
+def _internal_pin_with_condition(
+    distribution_name: str, version: str, condition: BaseMarker
+) -> str:
+    pin = f"{distribution_name}==={version}"
+    return pin if condition.is_any() else f"{pin}; {condition}"
+
+
+def _conditions_overlap(
+    python_environment: BaseMarker,
+    left: BaseMarker,
+    right: BaseMarker,
+) -> bool:
+    return not MultiMarker.of(python_environment, left, right).is_empty()
+
+
 def _parse_public_lock(
-    contents: bytes, *, distribution_name: str
+    contents: bytes, *, distribution_name: str, reject_vane: bool
 ) -> tuple[str, ...]:
     if len(contents) > PUBLIC_LOCK_MAX_BYTES:
         _fail(f"public dependency lock is too large for {distribution_name}")
@@ -553,7 +633,7 @@ def _parse_public_lock(
             raise SiteBuildError(
                 f"public dependency lock is invalid for {distribution_name}"
             ) from exception
-        if _is_vane_distribution(normalized_name):
+        if reject_vane and _is_vane_distribution(normalized_name):
             _fail(
                 f"public dependency closure for {distribution_name} contains "
                 f"Vane-owned package {normalized_name}"
@@ -584,7 +664,7 @@ class UvPublicDependencyResolver:
     """Build one universal, exact public dependency closure with uv."""
 
     def __init__(self) -> None:
-        self._cache: dict[tuple[str, tuple[str, ...]], tuple[str, ...]] = {}
+        self._cache: dict[tuple[str, tuple[str, ...]], bytes] = {}
         self._lock = Lock()
 
     def resolve(
@@ -593,6 +673,7 @@ class UvPublicDependencyResolver:
         *,
         requires_python: str,
         distribution_name: str,
+        reject_vane: bool,
     ) -> tuple[str, ...]:
         normalized_requirements = tuple(sorted(set(requirements), key=str.casefold))
         if not normalized_requirements:
@@ -601,14 +682,19 @@ class UvPublicDependencyResolver:
         with self._lock:
             cached = self._cache.get(cache_key)
             if cached is not None:
-                return cached
-            resolved = self._resolve_uncached(
-                normalized_requirements,
-                requires_python=requires_python,
-                distribution_name=distribution_name,
-            )
-            self._cache[cache_key] = resolved
-            return resolved
+                contents = cached
+            else:
+                contents = self._resolve_uncached(
+                    normalized_requirements,
+                    requires_python=requires_python,
+                    distribution_name=distribution_name,
+                )
+                self._cache[cache_key] = contents
+        return _parse_public_lock(
+            contents,
+            distribution_name=distribution_name,
+            reject_vane=reject_vane,
+        )
 
     def _resolve_uncached(
         self,
@@ -616,7 +702,7 @@ class UvPublicDependencyResolver:
         *,
         requires_python: str,
         distribution_name: str,
-    ) -> tuple[str, ...]:
+    ) -> bytes:
         try:
             with tempfile.TemporaryDirectory(prefix="vane-public-lock-") as temporary:
                 temporary_root = Path(temporary)
@@ -626,7 +712,10 @@ class UvPublicDependencyResolver:
                     tomli_w.dumps(
                         {
                             "project": {
-                                "name": "vane-registry-public-resolution-input",
+                                "name": (
+                                    "vane-registry-resolution-"
+                                    f"{secrets.token_hex(16)}"
+                                ),
                                 "version": "0",
                                 "requires-python": requires_python,
                                 "dependencies": list(requirements),
@@ -683,7 +772,7 @@ class UvPublicDependencyResolver:
                 "could not resolve public dependency closure for "
                 f"{distribution_name}"
             ) from exception
-        return _parse_public_lock(contents, distribution_name=distribution_name)
+        return contents
 
 
 _PUBLIC_DEPENDENCY_RESOLVER = UvPublicDependencyResolver()
@@ -697,7 +786,6 @@ def _exact_internal_requirement(
     if (
         requirement.url is not None
         or requirement.extras
-        or requirement.marker is not None
         or len(specifiers) != 1
         or specifiers[0].operator not in {"==", "==="}
         or "*" in specifiers[0].version
@@ -777,43 +865,98 @@ def _testpypi_install_commands(
     public_resolver: PublicDependencyResolver,
 ) -> list[str]:
     root_name = canonicalize_name(distribution_name)
-    selected_versions: dict[str, str] = {root_name: version_text}
-    pending = list(requirements)
+    python_environment = _python_environment_marker(
+        requires_python, distribution_name
+    )
+    root_key = (root_name, version_text)
+    selected_conditions: dict[tuple[str, str], BaseMarker] = {
+        root_key: AnyMarker()
+    }
+    release_requirements: dict[
+        tuple[str, str], tuple[Requirement, ...]
+    ] = {root_key: requirements}
+    release_aliases: dict[tuple[str, str], tuple[str, str]] = {}
+    pending = [(requirement, AnyMarker()) for requirement in requirements]
     public_requirements: set[str] = set()
     while pending:
-        requirement = _requirement_for_base_install(pending.pop())
-        if requirement is None:
+        raw_requirement, inherited_condition = pending.pop()
+        conditioned = _conditioned_requirement(
+            raw_requirement,
+            inherited_condition,
+            python_environment,
+            distribution_name,
+        )
+        if conditioned is None:
             continue
+        requirement, condition = conditioned
         normalized_name = canonicalize_name(requirement.name)
         if not _is_vane_distribution(normalized_name):
             if requirement.url is not None:
                 _fail(
                     f"{distribution_name} has an unsupported direct URL dependency"
                 )
-            public_requirements.add(str(requirement))
+            public_requirements.add(
+                _requirement_with_condition(requirement, condition)
+            )
             if len(public_requirements) > PACKAGE_REQUIREMENTS_MAX_COUNT:
                 _fail(f"public dependency closure is too large for {distribution_name}")
             continue
-        dependency_name, _requested_version = _exact_internal_requirement(
+        dependency_name, requested_version = _exact_internal_requirement(
             requirement, distribution_name
         )
-        selected_version = selected_versions.get(dependency_name)
-        if selected_version is not None:
-            if not requirement.specifier.contains(
-                selected_version, prereleases=True
+        selected_key = next(
+            (
+                key
+                for key in selected_conditions
+                if key[0] == dependency_name
+                and requirement.specifier.contains(key[1], prereleases=True)
+            ),
+            None,
+        )
+        if selected_key is None:
+            alias = (dependency_name, requested_version)
+            selected_key = release_aliases.get(alias)
+            if selected_key is None:
+                reported_version, child_requirements = _release_requirements(
+                    requirement,
+                    parent_distribution=distribution_name,
+                    package_index="testpypi",
+                    client=client,
+                )
+                selected_key = (dependency_name, reported_version)
+                release_aliases[alias] = selected_key
+                release_requirements.setdefault(
+                    selected_key, child_requirements
+                )
+
+        for other_key, other_condition in selected_conditions.items():
+            if (
+                other_key[0] == dependency_name
+                and other_key != selected_key
+                and _conditions_overlap(
+                    python_environment, condition, other_condition
+                )
             ):
                 _fail(f"Vane dependency versions conflict for {dependency_name}")
-            continue
-        if len(selected_versions) >= VANE_REQUIREMENTS_MAX_COUNT:
-            _fail(f"Vane dependency closure is too large for {distribution_name}")
-        reported_version, child_requirements = _release_requirements(
-            requirement,
-            parent_distribution=distribution_name,
-            package_index="testpypi",
-            client=client,
+
+        previous_condition = selected_conditions.get(selected_key)
+        merged_condition = (
+            condition
+            if previous_condition is None
+            else MarkerUnion.of(previous_condition, condition)
         )
-        selected_versions[dependency_name] = reported_version
-        pending.extend(child_requirements)
+        if previous_condition is not None and merged_condition == previous_condition:
+            continue
+        if (
+            previous_condition is None
+            and len(selected_conditions) >= VANE_REQUIREMENTS_MAX_COUNT
+        ):
+            _fail(f"Vane dependency closure is too large for {distribution_name}")
+        selected_conditions[selected_key] = merged_condition
+        pending.extend(
+            (child_requirement, condition)
+            for child_requirement in release_requirements[selected_key]
+        )
 
     commands: list[str] = []
     if public_requirements:
@@ -826,6 +969,7 @@ def _testpypi_install_commands(
             tuple(sorted(public_requirements, key=str.casefold)),
             requires_python=requires_python,
             distribution_name=distribution_name,
+            reject_vane=True,
         )
         if public_lock:
             commands.append(
@@ -853,8 +997,10 @@ def _testpypi_install_commands(
                 "--index-url",
                 _PACKAGE_INDEXES["testpypi"]["simple"],
                 *(
-                    f"{name}==={selected_versions[name]}"
-                    for name in sorted(selected_versions)
+                    _internal_pin_with_condition(name, version, condition)
+                    for (name, version), condition in sorted(
+                        selected_conditions.items()
+                    )
                 ),
             ]
         )
@@ -862,6 +1008,54 @@ def _testpypi_install_commands(
     if any(len(command) > 4096 for command in commands):
         _fail(f"generated install command is too long for {distribution_name}")
     return commands
+
+
+def _pypi_install_command(
+    distribution_name: str,
+    version_text: str,
+    package: Mapping[str, object],
+    public_resolver: PublicDependencyResolver,
+) -> str:
+    if package["wheel_count"] == 0:
+        _fail(f"{distribution_name} does not publish a non-yanked wheel")
+    requires_python = package["requires_python"]
+    if not isinstance(requires_python, str):
+        _fail(
+            f"{distribution_name} must declare Requires-Python to resolve "
+            "its PyPI dependency closure"
+        )
+    locked_requirements = public_resolver.resolve(
+        (f"{distribution_name}==={version_text}",),
+        requires_python=requires_python,
+        distribution_name=distribution_name,
+        reject_vane=False,
+    )
+    root_name = canonicalize_name(distribution_name)
+    root_requirements = tuple(
+        requirement
+        for requirement in map(Requirement, locked_requirements)
+        if canonicalize_name(requirement.name) == root_name
+    )
+    if (
+        len(root_requirements) != 1
+        or root_requirements[0].marker is not None
+        or not root_requirements[0].specifier.contains(
+            version_text, prereleases=True
+        )
+    ):
+        _fail(f"PyPI dependency lock omits {distribution_name}")
+    return _shell_command(
+        [
+            *_ISOLATED_PIP_COMMAND,
+            "install",
+            "--force-reinstall",
+            "--no-deps",
+            "--only-binary=:all:",
+            "--index-url",
+            _PACKAGE_INDEXES["pypi"]["simple"],
+            *locked_requirements,
+        ]
+    )
 
 
 def _installation_metadata(
@@ -891,16 +1085,11 @@ def _installation_metadata(
         )
     else:
         install_commands = [
-            _shell_command(
-                [
-                    *_ISOLATED_PIP_COMMAND,
-                    "install",
-                    "--force-reinstall",
-                    "--only-binary=:all:",
-                    "--index-url",
-                    _PACKAGE_INDEXES["pypi"]["simple"],
-                    f"{distribution_name}==={version_text}",
-                ]
+            _pypi_install_command(
+                distribution_name,
+                version_text,
+                package,
+                public_resolver,
             )
         ]
     if any(len(command) > 4096 for command in install_commands):

@@ -71,9 +71,18 @@ if the public closure contains a Vane-owned package. The registry never emits
 `--extra-index-url`, because pip gives no priority to the primary index and that
 pattern is vulnerable to dependency confusion. PEP 508 requirements and wheel
 filenames are parsed by `packaging`; `dep-logic` reduces compound extra markers
-without tying recipes to the build machine. Direct-URL requirements are omitted
-from published JSON and HTML so artifact locations or embedded credentials
-cannot leak through package metadata.
+without tying recipes to the build machine. Conditions on exact Vane-owned
+dependencies are preserved and propagated through their dependency graph;
+different versions are accepted only when their effective conditions do not
+overlap within the provider's `Requires-Python` range. Direct-URL requirements
+are omitted from published JSON and HTML so artifact locations or embedded
+credentials cannot leak through package metadata.
+
+For PyPI providers, the same `uv` resolver locks the provider and its complete
+dependency closure together. The registry publishes the installation command
+only after the provider has a non-yanked wheel and the wheel-only universal
+resolution succeeds; pip then installs the exact closure with dependency
+resolution disabled.
 
 `index.json` is generated deterministically from the discovery subset of the
 individual manifests and must be updated in the same pull request. Package

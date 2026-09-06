@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -11,6 +12,7 @@ from unittest.mock import patch
 
 import httpx
 from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from scripts.build_catalog import DEFAULT_MANIFEST_ROOT, PROJECT_ROOT, load_manifests
 from scripts.build_site import (
@@ -51,7 +53,7 @@ class _FakeMetadataClient:
 class _FakePublicDependencyResolver:
     def __init__(self, resolved: tuple[str, ...]) -> None:
         self.resolved = resolved
-        self.calls: list[tuple[tuple[str, ...], str, str]] = []
+        self.calls: list[tuple[tuple[str, ...], str, str, bool]] = []
 
     def resolve(
         self,
@@ -59,8 +61,11 @@ class _FakePublicDependencyResolver:
         *,
         requires_python: str,
         distribution_name: str,
+        reject_vane: bool,
     ) -> tuple[str, ...]:
-        self.calls.append((requirements, requires_python, distribution_name))
+        self.calls.append(
+            (requirements, requires_python, distribution_name, reject_vane)
+        )
         return self.resolved
 
 
@@ -105,7 +110,12 @@ class MetadataClientTests(unittest.TestCase):
 class PublicDependencyResolverTests(unittest.TestCase):
     def test_lock_parser_accepts_only_exact_public_requirements(self) -> None:
         self.assertEqual(
-            _parse_public_lock(b"", distribution_name="vane-extension-test"), ()
+            _parse_public_lock(
+                b"",
+                distribution_name="vane-extension-test",
+                reject_vane=True,
+            ),
+            (),
         )
         self.assertEqual(
             _parse_public_lock(
@@ -114,11 +124,20 @@ class PublicDependencyResolverTests(unittest.TestCase):
                     'conditional==2.0; python_version < "3.12"\n'
                 ).encode(),
                 distribution_name="vane-extension-test",
+                reject_vane=True,
             ),
             (
                 'conditional==2.0; python_version < "3.12"',
                 "foo-bar==1.0",
             ),
+        )
+        self.assertEqual(
+            _parse_public_lock(
+                b"vane-ai==0.2.0\n",
+                distribution_name="vane-ai",
+                reject_vane=False,
+            ),
+            ("vane-ai==0.2.0",),
         )
 
     def test_lock_parser_rejects_unsafe_resolutions(self) -> None:
@@ -132,7 +151,9 @@ class PublicDependencyResolverTests(unittest.TestCase):
         for case, contents in cases.items():
             with self.subTest(case=case), self.assertRaises(SiteBuildError):
                 _parse_public_lock(
-                    contents, distribution_name="vane-extension-test"
+                    contents,
+                    distribution_name="vane-extension-test",
+                    reject_vane=True,
                 )
 
     def test_uv_resolution_is_config_free_bounded_and_cached(self) -> None:
@@ -173,16 +194,61 @@ class PublicDependencyResolverTests(unittest.TestCase):
                 ("public-package>=1",),
                 requires_python=">=3.10,<3.15",
                 distribution_name="vane-extension-test",
+                reject_vane=True,
             )
             second = resolver.resolve(
                 ("public-package>=1",),
                 requires_python=">=3.10,<3.15",
                 distribution_name="vane-extension-other",
+                reject_vane=True,
             )
 
         self.assertEqual(first, ("public-package==1.2.3",))
         self.assertEqual(second, first)
         self.assertEqual(run_mock.call_count, 1)
+
+    def test_cached_resolution_still_applies_the_vane_policy(self) -> None:
+        resolver = UvPublicDependencyResolver()
+
+        def run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            output_path = Path(arguments[arguments.index("--output-file") + 1])
+            output_path.write_bytes(b"vane-ai==0.2.0\n")
+            return subprocess.CompletedProcess(arguments, 0)
+
+        with patch("scripts.build_site.subprocess.run", side_effect=run) as run_mock:
+            self.assertEqual(
+                resolver.resolve(
+                    ("vane-ai==0.2.0",),
+                    requires_python=">=3.10,<3.15",
+                    distribution_name="vane-ai",
+                    reject_vane=False,
+                ),
+                ("vane-ai==0.2.0",),
+            )
+            with self.assertRaisesRegex(SiteBuildError, "Vane-owned"):
+                resolver.resolve(
+                    ("vane-ai==0.2.0",),
+                    requires_python=">=3.10,<3.15",
+                    distribution_name="vane-extension-test",
+                    reject_vane=True,
+                )
+
+        self.assertEqual(run_mock.call_count, 1)
+
+    def test_uv_resolution_failure_is_reported_without_process_output(self) -> None:
+        resolver = UvPublicDependencyResolver()
+        completed = subprocess.CompletedProcess([], 1)
+
+        with (
+            patch("scripts.build_site.subprocess.run", return_value=completed),
+            self.assertRaisesRegex(SiteBuildError, "could not resolve"),
+        ):
+            resolver.resolve(
+                ("sdist-only-package==1",),
+                requires_python=">=3.10,<3.15",
+                distribution_name="vane-extension-test",
+                reject_vane=False,
+            )
 
 
 def _github_response(repository: str, stars: int = 7) -> dict[str, object]:
@@ -450,11 +516,15 @@ class BuildSiteTests(unittest.TestCase):
                 "data": {"last_week": 123}
             },
         }
+        public_resolver = _FakePublicDependencyResolver(
+            ("public-transitive==1.2.3", f"{distribution}==0.2.0")
+        )
 
         detail = build_details(
             manifest_root=self._single_manifest_root(manifest),
             generated_at=GENERATED_AT,
             client=_FakeMetadataClient(responses),
+            public_resolver=public_resolver,
         )[0]
 
         self.assertEqual(
@@ -466,11 +536,52 @@ class BuildSiteTests(unittest.TestCase):
             [
                 "env PIP_CONFIG_FILE=/dev/null "
                 "python -m pip --isolated install "
-                "--force-reinstall --only-binary=:all: "
+                "--force-reinstall --no-deps --only-binary=:all: "
                 "--index-url https://pypi.org/simple/ "
-                f"{distribution}===0.2.0"
+                f"public-transitive==1.2.3 {distribution}==0.2.0"
             ],
         )
+        self.assertEqual(
+            public_resolver.calls,
+            [
+                (
+                    (f"{distribution}===0.2.0",),
+                    ">=3.10,<3.15",
+                    distribution,
+                    False,
+                )
+            ],
+        )
+
+    def test_pypi_recipe_requires_a_wheel_for_the_provider(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        manifest["package_index"] = "pypi"
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://pypi.org/pypi/{distribution}/json": (
+                _sdist_only_response(distribution)
+            ),
+            f"https://pypistats.org/api/packages/{distribution}/recent": {
+                "data": {"last_week": 123}
+            },
+        }
+        public_resolver = _FakePublicDependencyResolver(
+            (f"{distribution}==0.2.0",)
+        )
+
+        with self.assertRaisesRegex(SiteBuildError, "non-yanked wheel"):
+            build_details(
+                manifest_root=self._single_manifest_root(manifest),
+                generated_at=GENERATED_AT,
+                client=_FakeMetadataClient(responses),
+                public_resolver=public_resolver,
+            )
+        self.assertEqual(public_resolver.calls, [])
 
     def test_testpypi_installation_keeps_indexes_isolated(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
@@ -569,6 +680,7 @@ class BuildSiteTests(unittest.TestCase):
                     ),
                     ">=3.10,<3.15",
                     distribution,
+                    True,
                 )
             ],
         )
@@ -605,7 +717,154 @@ class BuildSiteTests(unittest.TestCase):
         )
         self.assertNotIn("example.invalid", json.dumps(detail))
 
-    def test_empty_public_resolution_omits_the_public_install_step(self) -> None:
+    def test_testpypi_preserves_and_propagates_internal_conditions(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        older_vane = "0.2.0.dev1"
+        newer_vane = "0.2.0.dev2"
+        avro_version = "1.0"
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                distribution,
+                requires_dist=[
+                    (
+                        f"vane-extension-avro==={avro_version}; "
+                        'sys_platform == "linux"'
+                    ),
+                    f'vane-ai==={newer_vane}; python_version >= "3.14"',
+                ],
+            ),
+            (
+                "https://test.pypi.org/pypi/"
+                f"vane-extension-avro/{avro_version}/json"
+            ): _release_response(
+                "vane-extension-avro",
+                avro_version,
+                [f'vane-ai==={older_vane}; python_version < "3.14"'],
+            ),
+            f"https://test.pypi.org/pypi/vane-ai/{older_vane}/json": (
+                _release_response(
+                    "vane-ai",
+                    older_vane,
+                    ['old-public>=1; platform_machine == "x86_64"'],
+                )
+            ),
+            f"https://test.pypi.org/pypi/vane-ai/{newer_vane}/json": (
+                _release_response("vane-ai", newer_vane, ["new-public>=2"])
+            ),
+        }
+        public_resolver = _FakePublicDependencyResolver(
+            (
+                'new-public==2.1; python_version >= "3.14"',
+                'old-public==1.2; python_version < "3.14"',
+            )
+        )
+
+        detail = build_details(
+            manifest_root=self._single_manifest_root(manifest),
+            generated_at=GENERATED_AT,
+            client=_FakeMetadataClient(responses),
+            public_resolver=public_resolver,
+        )[0]
+
+        public_inputs = {
+            requirement.name: requirement
+            for requirement in map(Requirement, public_resolver.calls[0][0])
+        }
+        self.assertEqual(
+            str(public_inputs["new-public"].marker),
+            'python_version >= "3.14"',
+        )
+        old_public_marker = str(public_inputs["old-public"].marker)
+        self.assertIn('sys_platform == "linux"', old_public_marker)
+        self.assertIn('python_version < "3.14"', old_public_marker)
+        self.assertIn('platform_machine == "x86_64"', old_public_marker)
+        self.assertTrue(public_resolver.calls[0][3])
+
+        public_arguments = shlex.split(
+            detail["installation"]["install_commands"][0]
+        )
+        installed_public = {
+            requirement.name: requirement
+            for requirement in map(Requirement, public_arguments[-2:])
+        }
+        self.assertEqual(
+            str(installed_public["new-public"].marker),
+            'python_version >= "3.14"',
+        )
+        self.assertEqual(
+            str(installed_public["old-public"].marker),
+            'python_version < "3.14"',
+        )
+
+        testpypi_arguments = shlex.split(
+            detail["installation"]["install_commands"][-1]
+        )
+        internal_requirements = [
+            Requirement(argument)
+            for argument in testpypi_arguments
+            if canonicalize_name(argument.split("=", 1)[0]).startswith("vane-")
+        ]
+        by_version = {
+            next(iter(requirement.specifier)).version: requirement
+            for requirement in internal_requirements
+            if canonicalize_name(requirement.name) == "vane-ai"
+        }
+        self.assertEqual(set(by_version), {older_vane, newer_vane})
+        older_marker = str(by_version[older_vane].marker)
+        self.assertIn('sys_platform == "linux"', older_marker)
+        self.assertIn('python_version < "3.14"', older_marker)
+        self.assertEqual(
+            str(by_version[newer_vane].marker),
+            'python_version >= "3.14"',
+        )
+        avro = next(
+            requirement
+            for requirement in internal_requirements
+            if canonicalize_name(requirement.name) == "vane-extension-avro"
+        )
+        self.assertEqual(str(avro.marker), 'sys_platform == "linux"')
+
+    def test_testpypi_rejects_overlapping_internal_versions(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        first_version = "0.2.0.dev1"
+        second_version = "0.2.0.dev2"
+        responses = {
+            (
+                "https://api.github.com/repos/"
+                f"{repository.removeprefix('https://github.com/')}"
+            ): _github_response(repository),
+            f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                distribution,
+                requires_dist=[
+                    f'vane-ai==={first_version}; python_version <= "3.14"',
+                    f'vane-ai==={second_version}; python_version >= "3.14"',
+                ],
+            ),
+            f"https://test.pypi.org/pypi/vane-ai/{first_version}/json": (
+                _release_response("vane-ai", first_version, [])
+            ),
+            f"https://test.pypi.org/pypi/vane-ai/{second_version}/json": (
+                _release_response("vane-ai", second_version, [])
+            ),
+        }
+
+        with self.assertRaisesRegex(SiteBuildError, "versions conflict"):
+            build_details(
+                manifest_root=self._single_manifest_root(manifest),
+                generated_at=GENERATED_AT,
+                client=_FakeMetadataClient(responses),
+                public_resolver=_FakePublicDependencyResolver(()),
+            )
+
+    def test_inactive_public_requirement_omits_the_public_install_step(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
         distribution = str(manifest["distribution_name"])
         repository = str(manifest["repository"])
@@ -629,10 +888,7 @@ class BuildSiteTests(unittest.TestCase):
         )[0]
 
         self.assertEqual(len(detail["installation"]["install_commands"]), 1)
-        self.assertEqual(
-            public_resolver.calls[0][0],
-            ('legacy-package; python_version < "3"',),
-        )
+        self.assertEqual(public_resolver.calls, [])
 
     def test_public_resolution_requires_a_python_range(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
