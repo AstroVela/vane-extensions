@@ -7,7 +7,9 @@ import subprocess
 import tempfile
 import unittest
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 import httpx
@@ -249,6 +251,38 @@ class PublicDependencyResolverTests(unittest.TestCase):
                 distribution_name="vane-extension-test",
                 reject_vane=False,
             )
+
+    def test_distinct_uv_resolutions_run_concurrently(self) -> None:
+        resolver = UvPublicDependencyResolver()
+        subprocess_barrier = Barrier(2)
+
+        def run(arguments: list[str], **_kwargs: object) -> subprocess.CompletedProcess:
+            subprocess_barrier.wait(timeout=5)
+            output_path = Path(arguments[arguments.index("--output-file") + 1])
+            output_path.write_bytes(b"resolved-package==1.0\n")
+            return subprocess.CompletedProcess(arguments, 0)
+
+        def resolve(requirement: str) -> tuple[str, ...]:
+            return resolver.resolve(
+                (requirement,),
+                requires_python=">=3.10,<3.15",
+                distribution_name=requirement.split("=", 1)[0],
+                reject_vane=False,
+            )
+
+        with (
+            patch("scripts.build_site.subprocess.run", side_effect=run) as run_mock,
+            ThreadPoolExecutor(max_workers=2) as executor,
+        ):
+            results = tuple(
+                executor.map(resolve, ("first-package==1", "second-package==1"))
+            )
+
+        self.assertEqual(
+            results,
+            (("resolved-package==1.0",), ("resolved-package==1.0",)),
+        )
+        self.assertEqual(run_mock.call_count, 2)
 
 
 def _github_response(repository: str, stars: int = 7) -> dict[str, object]:

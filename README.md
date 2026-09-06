@@ -84,6 +84,10 @@ only after the provider has a non-yanked wheel and the wheel-only universal
 resolution succeeds; pip then installs the exact closure with dependency
 resolution disabled.
 
+During site generation, identical PyPI closure requests share one in-flight
+resolution while distinct closures resolve concurrently with the surrounding
+metadata workers; the cache mutex is never held while `uv` is running.
+
 `index.json` is generated deterministically from the discovery subset of the
 individual manifests and must be updated in the same pull request. Package
 versions and wheel/Python platform availability are derived from the manifest's

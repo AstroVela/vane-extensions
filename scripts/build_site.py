@@ -13,7 +13,7 @@ import subprocess
 import sys
 import tempfile
 from collections.abc import Mapping
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import copy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -665,6 +665,9 @@ class UvPublicDependencyResolver:
 
     def __init__(self) -> None:
         self._cache: dict[tuple[str, tuple[str, ...]], bytes] = {}
+        self._inflight: dict[
+            tuple[str, tuple[str, ...]], Future[bytes]
+        ] = {}
         self._lock = Lock()
 
     def resolve(
@@ -684,12 +687,41 @@ class UvPublicDependencyResolver:
             if cached is not None:
                 contents = cached
             else:
-                contents = self._resolve_uncached(
-                    normalized_requirements,
-                    requires_python=requires_python,
-                    distribution_name=distribution_name,
-                )
-                self._cache[cache_key] = contents
+                future = self._inflight.get(cache_key)
+                owns_resolution = future is None
+                if future is None:
+                    future = Future()
+                    self._inflight[cache_key] = future
+        if cached is None:
+            if owns_resolution:
+                try:
+                    contents = self._resolve_uncached(
+                        normalized_requirements,
+                        requires_python=requires_python,
+                    )
+                except BaseException as exception:
+                    future.set_exception(exception)
+                    with self._lock:
+                        self._inflight.pop(cache_key, None)
+                    if isinstance(exception, SiteBuildError):
+                        raise SiteBuildError(
+                            "could not resolve public dependency closure for "
+                            f"{distribution_name}"
+                        ) from exception
+                    raise
+                else:
+                    future.set_result(contents)
+                    with self._lock:
+                        self._cache[cache_key] = contents
+                        self._inflight.pop(cache_key, None)
+            else:
+                try:
+                    contents = future.result()
+                except SiteBuildError as exception:
+                    raise SiteBuildError(
+                        "could not resolve public dependency closure for "
+                        f"{distribution_name}"
+                    ) from exception
         return _parse_public_lock(
             contents,
             distribution_name=distribution_name,
@@ -701,7 +733,6 @@ class UvPublicDependencyResolver:
         requirements: tuple[str, ...],
         *,
         requires_python: str,
-        distribution_name: str,
     ) -> bytes:
         try:
             with tempfile.TemporaryDirectory(prefix="vane-public-lock-") as temporary:
@@ -759,18 +790,14 @@ class UvPublicDependencyResolver:
                     check=False,
                 )
                 if result.returncode != 0:
-                    _fail(
-                        "could not resolve public dependency closure for "
-                        f"{distribution_name}"
-                    )
+                    _fail("could not resolve public dependency closure")
                 with output_path.open("rb") as output_file:
                     contents = output_file.read(PUBLIC_LOCK_MAX_BYTES + 1)
         except SiteBuildError:
             raise
         except (OSError, subprocess.SubprocessError) as exception:
             raise SiteBuildError(
-                "could not resolve public dependency closure for "
-                f"{distribution_name}"
+                "could not resolve public dependency closure"
             ) from exception
         return contents
 
