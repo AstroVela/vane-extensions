@@ -61,8 +61,11 @@
         <dt>Documentation</dt><dd><a href="{{ documentation.url }}">Provider documentation</a></dd>
       </dl>
       <h2>Install</h2>
-      {% if installation.install_commands %}
-      <pre><code>{{ installation.install_commands | join("\n") }}</code></pre>
+      {% if installation.posix_install_commands %}
+      <h3>POSIX shell</h3>
+      <pre><code>{{ installation.posix_install_commands | join("\n") }}</code></pre>
+      <h3>Windows PowerShell</h3>
+      <pre><code>{{ installation.powershell_install_commands | join("\n") }}</code></pre>
       {% else %}
       <p>No install command is available until this package is published.</p>
       {% endif %}

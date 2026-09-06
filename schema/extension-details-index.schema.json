@@ -172,10 +172,21 @@
             "type": "object",
             "additionalProperties": false,
             "required": [
-              "install_commands"
+              "posix_install_commands",
+              "powershell_install_commands"
             ],
             "properties": {
-              "install_commands": {
+              "posix_install_commands": {
+                "type": "array",
+                "maxItems": 2,
+                "uniqueItems": true,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 4096
+                }
+              },
+              "powershell_install_commands": {
                 "type": "array",
                 "maxItems": 2,
                 "uniqueItems": true,
@@ -211,7 +222,10 @@
               "properties": {
                 "installation": {
                   "properties": {
-                    "install_commands": {
+                    "posix_install_commands": {
+                      "maxItems": 0
+                    },
+                    "powershell_install_commands": {
                       "maxItems": 0
                     }
                   }
@@ -222,7 +236,10 @@
               "properties": {
                 "installation": {
                   "properties": {
-                    "install_commands": {
+                    "posix_install_commands": {
+                      "minItems": 1
+                    },
+                    "powershell_install_commands": {
                       "minItems": 1
                     }
                   }

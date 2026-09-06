@@ -109,8 +109,15 @@
             details.textContent = "Details";
             description.textContent = entry.description;
             command.className = "install";
-            command.textContent = entry.installation.install_commands.length
-              ? entry.installation.install_commands.join("\n")
+            const installation = entry.installation;
+            command.textContent = installation.posix_install_commands.length
+              ? [
+                  "POSIX shell:",
+                  ...installation.posix_install_commands,
+                  "",
+                  "Windows PowerShell:",
+                  ...installation.powershell_install_commands,
+                ].join("\n")
               : "No install command is available until this package is published.";
             facts.className = "facts meta";
             const version = document.createElement("span");
@@ -120,11 +127,22 @@
               ? `Version ${entry.package.latest_version}`
               : `Not published on ${entry.package.index}`;
             stars.textContent = `${entry.source.github_stars} GitHub stars`;
-            python.textContent = entry.package.python_versions.length
-              ? `Python ${entry.package.python_versions.join(", ")}`
-              : entry.package.wheel_count
-                ? `Wheel tags ${entry.package.python_tags.join(", ")}`
-                : "No wheels published";
+            if (entry.package.wheel_count) {
+              const pythonCompatibility = [];
+              if (entry.package.python_versions.length) {
+                pythonCompatibility.push(
+                  `Python ${entry.package.python_versions.join(", ")}`,
+                );
+              }
+              if (entry.package.python_tags.length) {
+                pythonCompatibility.push(
+                  `Wheel tags ${entry.package.python_tags.join(", ")}`,
+                );
+              }
+              python.textContent = pythonCompatibility.join(" · ");
+            } else {
+              python.textContent = "No wheels published";
+            }
             facts.append(version, stars, python);
             metadata.className = "meta";
             repository.href = entry.repository;

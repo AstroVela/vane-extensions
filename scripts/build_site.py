@@ -78,9 +78,7 @@ _PACKAGE_INDEXES = {
         "simple": "https://test.pypi.org/simple/",
     },
 }
-_ISOLATED_PIP_COMMAND = (
-    "env",
-    "PIP_CONFIG_FILE=/dev/null",
+_PIP_COMMAND = (
     "python",
     "-m",
     "pip",
@@ -891,18 +889,46 @@ def _release_requirements(
     )
 
 
-def _shell_command(arguments: list[str]) -> str:
-    return " ".join(shlex.quote(argument) for argument in arguments)
+def _pip_install_arguments(
+    index_url: str, requirements: tuple[str, ...]
+) -> list[str]:
+    return [
+        *_PIP_COMMAND,
+        "install",
+        "--force-reinstall",
+        "--no-deps",
+        "--only-binary=:all:",
+        "--index-url",
+        index_url,
+        *requirements,
+    ]
 
 
-def _testpypi_install_commands(
+def _posix_install_command(arguments: list[str]) -> str:
+    return shlex.join(["env", "PIP_CONFIG_FILE=/dev/null", *arguments])
+
+
+def _powershell_quote(argument: str) -> str:
+    """Return one literal PowerShell argument without interpolation."""
+    escaped = argument.replace("'", "''")
+    return f"'{escaped}'"
+
+
+def _powershell_install_command(arguments: list[str]) -> str:
+    quoted_arguments = " ".join(
+        _powershell_quote(argument) for argument in arguments
+    )
+    return f"$env:PIP_CONFIG_FILE = 'NUL'; & {quoted_arguments}"
+
+
+def _testpypi_install_arguments(
     distribution_name: str,
     version_text: str,
     requires_python: object,
     requirements: tuple[Requirement, ...],
     client: JsonMetadataClient,
     public_resolver: PublicDependencyResolver,
-) -> list[str]:
+) -> list[list[str]]:
     root_name = canonicalize_name(distribution_name)
     python_environment = _python_environment_marker(
         requires_python, distribution_name
@@ -1019,7 +1045,7 @@ def _testpypi_install_commands(
             for child_requirement in release_requirements[selected_key]
         )
 
-    commands: list[str] = []
+    commands: list[list[str]] = []
     if public_requirements:
         if not isinstance(requires_python, str):
             _fail(
@@ -1034,49 +1060,30 @@ def _testpypi_install_commands(
         )
         if public_lock:
             commands.append(
-                _shell_command(
-                    [
-                        *_ISOLATED_PIP_COMMAND,
-                        "install",
-                        "--force-reinstall",
-                        "--no-deps",
-                        "--only-binary=:all:",
-                        "--index-url",
-                        _PACKAGE_INDEXES["pypi"]["simple"],
-                        *public_lock,
-                    ]
+                _pip_install_arguments(
+                    _PACKAGE_INDEXES["pypi"]["simple"], public_lock
                 )
             )
     commands.append(
-        _shell_command(
-            [
-                *_ISOLATED_PIP_COMMAND,
-                "install",
-                "--force-reinstall",
-                "--no-deps",
-                "--only-binary=:all:",
-                "--index-url",
-                _PACKAGE_INDEXES["testpypi"]["simple"],
-                *(
-                    _internal_pin_with_condition(name, version, condition)
-                    for (name, version), condition in sorted(
-                        selected_conditions.items()
-                    )
-                ),
-            ]
+        _pip_install_arguments(
+            _PACKAGE_INDEXES["testpypi"]["simple"],
+            tuple(
+                _internal_pin_with_condition(name, version, condition)
+                for (name, version), condition in sorted(
+                    selected_conditions.items()
+                )
+            ),
         )
     )
-    if any(len(command) > 4096 for command in commands):
-        _fail(f"generated install command is too long for {distribution_name}")
     return commands
 
 
-def _pypi_install_command(
+def _pypi_install_arguments(
     distribution_name: str,
     version_text: str,
     package: Mapping[str, object],
     public_resolver: PublicDependencyResolver,
-) -> str:
+) -> list[str]:
     if package["wheel_count"] == 0:
         _fail(f"{distribution_name} does not publish a non-yanked wheel")
     requires_python = package["requires_python"]
@@ -1105,17 +1112,8 @@ def _pypi_install_command(
         )
     ):
         _fail(f"PyPI dependency lock omits {distribution_name}")
-    return _shell_command(
-        [
-            *_ISOLATED_PIP_COMMAND,
-            "install",
-            "--force-reinstall",
-            "--no-deps",
-            "--only-binary=:all:",
-            "--index-url",
-            _PACKAGE_INDEXES["pypi"]["simple"],
-            *locked_requirements,
-        ]
+    return _pip_install_arguments(
+        _PACKAGE_INDEXES["pypi"]["simple"], locked_requirements
     )
 
 
@@ -1130,13 +1128,13 @@ def _installation_metadata(
 ) -> dict[str, object]:
     version_text = package["latest_version"]
     if not package["published"]:
-        install_commands: list[str] = []
+        install_arguments: list[list[str]] = []
     elif not isinstance(version_text, str):
         _fail(f"published package version is missing for {distribution_name}")
     elif package_index == "testpypi":
         if package["wheel_count"] == 0:
             _fail(f"{distribution_name} does not publish a non-yanked wheel")
-        install_commands = _testpypi_install_commands(
+        install_arguments = _testpypi_install_arguments(
             distribution_name,
             version_text,
             package["requires_python"],
@@ -1145,22 +1143,35 @@ def _installation_metadata(
             public_resolver,
         )
     else:
-        install_commands = [
-            _pypi_install_command(
+        install_arguments = [
+            _pypi_install_arguments(
                 distribution_name,
                 version_text,
                 package,
                 public_resolver,
             )
         ]
-    if any(len(command) > 4096 for command in install_commands):
+    posix_install_commands = [
+        _posix_install_command(arguments) for arguments in install_arguments
+    ]
+    powershell_install_commands = [
+        _powershell_install_command(arguments) for arguments in install_arguments
+    ]
+    if any(
+        len(command) > 4096
+        for command in (*posix_install_commands, *powershell_install_commands)
+    ):
         _fail(f"generated install command is too long for {distribution_name}")
     load_example = (
         "import vane\n\n"
         'connection = vane.connect(\":memory:\")\n'
         f'vane.load_installed_extension("{extension_name}", connection=connection)'
     )
-    return {"install_commands": install_commands, "load_example": load_example}
+    return {
+        "posix_install_commands": posix_install_commands,
+        "powershell_install_commands": powershell_install_commands,
+        "load_example": load_example,
+    }
 
 
 def _detail_record(
@@ -1275,7 +1286,12 @@ def _summary_record(detail: Mapping[str, object]) -> dict[str, object]:
                 "python_tags",
             )
         },
-        "installation": {"install_commands": installation["install_commands"]},
+        "installation": {
+            "posix_install_commands": installation["posix_install_commands"],
+            "powershell_install_commands": installation[
+                "powershell_install_commands"
+            ],
+        },
     }
 
 

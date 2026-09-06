@@ -23,6 +23,7 @@ from scripts.build_site import (
     UvPublicDependencyResolver,
     _detail_html,
     _parse_public_lock,
+    _powershell_install_command,
     _requirement_for_base_install,
     assemble_site,
     build_details,
@@ -397,6 +398,17 @@ def _checked_in_manifest(extension_name: str) -> dict[str, object]:
 
 
 class BuildSiteTests(unittest.TestCase):
+    def test_powershell_install_command_quotes_literal_arguments(self) -> None:
+        command = _powershell_install_command(
+            ["python", "package==1; platform_machine == \"O'Reilly\""]
+        )
+
+        self.assertEqual(
+            command,
+            "$env:PIP_CONFIG_FILE = 'NUL'; & "
+            "'python' 'package==1; platform_machine == \"O''Reilly\"'",
+        )
+
     def test_empty_extra_marker_reduction_is_platform_independent(self) -> None:
         self.assertIsNone(
             _requirement_for_base_install(
@@ -484,7 +496,7 @@ class BuildSiteTests(unittest.TestCase):
         self.assertNotIn("files.example", serialized)
         self.assertNotIn("not-published-by-the-registry", serialized)
 
-    def test_versioned_generic_python_wheel_tag_is_reported(self) -> None:
+    def test_generic_python_wheel_tags_preserve_exact_and_broad_support(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
         distribution = str(manifest["distribution_name"])
         repository = str(manifest["repository"])
@@ -496,6 +508,11 @@ class BuildSiteTests(unittest.TestCase):
         first_wheel["filename"] = (
             f"{distribution.replace('-', '_')}-0.2.0-py310-none-any.whl"
         )
+        broad_wheel = dict(first_wheel)
+        broad_wheel["filename"] = (
+            f"{distribution.replace('-', '_')}-0.2.0-py3-none-any.whl"
+        )
+        package_urls.insert(1, broad_wheel)
         responses = {
             (
                 "https://api.github.com/repos/"
@@ -511,7 +528,15 @@ class BuildSiteTests(unittest.TestCase):
         )[0]
 
         self.assertEqual(detail["package"]["python_versions"], ["3.10", "3.14"])
-        self.assertEqual(detail["package"]["python_tags"], ["cp314", "py310"])
+        self.assertEqual(
+            detail["package"]["python_tags"], ["cp314", "py3", "py310"]
+        )
+        landing_page = (PROJECT_ROOT / "site" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("pythonCompatibility", landing_page)
+        self.assertIn("entry.package.python_versions.join", landing_page)
+        self.assertIn("entry.package.python_tags.join", landing_page)
 
     def test_missing_package_is_reported_without_cross_index_fallback(self) -> None:
         client = _FakeMetadataClient(_responses_for_checked_in_manifests())
@@ -523,7 +548,10 @@ class BuildSiteTests(unittest.TestCase):
         )
         self.assertFalse(lance["package"]["published"])
         self.assertIsNone(lance["package"]["latest_version"])
-        self.assertEqual(lance["installation"]["install_commands"], [])
+        self.assertEqual(lance["installation"]["posix_install_commands"], [])
+        self.assertEqual(
+            lance["installation"]["powershell_install_commands"], []
+        )
         lance_requests = [
             url for url, _headers, _missing in client.requests if "lance" in url
         ]
@@ -603,13 +631,23 @@ class BuildSiteTests(unittest.TestCase):
             {"downloads_last_week": 123, "source": "pypistats.org"},
         )
         self.assertEqual(
-            detail["installation"]["install_commands"],
+            detail["installation"]["posix_install_commands"],
             [
                 "env PIP_CONFIG_FILE=/dev/null "
                 "python -m pip --isolated install "
                 "--force-reinstall --no-deps --only-binary=:all: "
                 "--index-url https://pypi.org/simple/ "
                 f"public-transitive==1.2.3 {distribution}==0.2.0"
+            ],
+        )
+        self.assertEqual(
+            detail["installation"]["powershell_install_commands"],
+            [
+                "$env:PIP_CONFIG_FILE = 'NUL'; & "
+                "'python' '-m' 'pip' '--isolated' 'install' "
+                "'--force-reinstall' '--no-deps' '--only-binary=:all:' "
+                "'--index-url' 'https://pypi.org/simple/' "
+                f"'public-transitive==1.2.3' '{distribution}==0.2.0'"
             ],
         )
         self.assertEqual(
@@ -726,8 +764,11 @@ class BuildSiteTests(unittest.TestCase):
         )[0]
 
         public_command, testpypi_command = detail["installation"][
-            "install_commands"
+            "posix_install_commands"
         ]
+        powershell_public_command, powershell_testpypi_command = detail[
+            "installation"
+        ]["powershell_install_commands"]
         self.assertEqual(
             detail["package"]["requires_dist"],
             [
@@ -783,8 +824,33 @@ class BuildSiteTests(unittest.TestCase):
         self.assertIn(f"{distribution}==={provider_version}", testpypi_command)
         self.assertNotIn("vane-extension-optional", testpypi_command)
         self.assertNotIn("https://pypi.org/simple/", testpypi_command)
+        self.assertTrue(
+            powershell_public_command.startswith(
+                "$env:PIP_CONFIG_FILE = 'NUL'; & "
+                "'python' '-m' 'pip' '--isolated' 'install'"
+            )
+        )
+        self.assertIn(
+            "'platform-marker==1.0; sys_platform == \"extra\"'",
+            powershell_public_command,
+        )
+        self.assertIn(
+            "'--index-url' 'https://test.pypi.org/simple/'",
+            powershell_testpypi_command,
+        )
+        self.assertIn(
+            f"'vane-ai==={vane_version}'", powershell_testpypi_command
+        )
+        self.assertNotIn("/dev/null", powershell_public_command)
+        self.assertNotIn("/dev/null", powershell_testpypi_command)
         self.assertNotIn(
-            "--extra-index-url", "\n".join(detail["installation"]["install_commands"])
+            "--extra-index-url",
+            "\n".join(
+                [
+                    *detail["installation"]["posix_install_commands"],
+                    *detail["installation"]["powershell_install_commands"],
+                ]
+            ),
         )
         self.assertNotIn("example.invalid", json.dumps(detail))
 
@@ -864,7 +930,7 @@ class BuildSiteTests(unittest.TestCase):
         self.assertTrue(public_resolver.calls[0][3])
 
         public_arguments = shlex.split(
-            detail["installation"]["install_commands"][0]
+            detail["installation"]["posix_install_commands"][0]
         )
         installed_public = {
             requirement.name: requirement
@@ -880,7 +946,7 @@ class BuildSiteTests(unittest.TestCase):
         )
 
         testpypi_arguments = shlex.split(
-            detail["installation"]["install_commands"][-1]
+            detail["installation"]["posix_install_commands"][-1]
         )
         internal_requirements = [
             Requirement(argument)
@@ -999,7 +1065,12 @@ class BuildSiteTests(unittest.TestCase):
             public_resolver=public_resolver,
         )[0]
 
-        self.assertEqual(len(detail["installation"]["install_commands"]), 1)
+        self.assertEqual(
+            len(detail["installation"]["posix_install_commands"]), 1
+        )
+        self.assertEqual(
+            len(detail["installation"]["powershell_install_commands"]), 1
+        )
         self.assertEqual(public_resolver.calls, [])
 
     def test_public_resolution_requires_a_python_range(self) -> None:
