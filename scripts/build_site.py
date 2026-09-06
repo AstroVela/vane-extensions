@@ -33,6 +33,7 @@ from dep_logic.markers import (
     from_pkg_marker,
 )
 from dep_logic.markers.utils import intersection
+from dep_logic.specifiers import RangeSpecifier, UnionSpecifier, from_specifierset
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from packaging.markers import Marker
 from packaging.requirements import InvalidRequirement, Requirement
@@ -79,6 +80,7 @@ _VERSIONED_INTERPRETER_TAG_RE = re.compile(
     r"^([a-z][a-z0-9_]*?)([0-9])([0-9]+)$"
 )
 _CPYTHON_ABI_RE = re.compile(r"cp([0-9])([0-9]+)(t?)(d?)(m?)(u?)")
+_PYPY_ABI_RE = re.compile(r"pypy([0-9])([0-9]+)_pp[0-9]+")
 _LINUX_PLATFORM_RE = re.compile(
     r"^(manylinux(?:_[0-9]+_[0-9]+|1|2010|2014)|"
     r"musllinux_[0-9]+_[0-9]+|linux)_(.+)$"
@@ -637,6 +639,14 @@ def _wheel_python_environment(tag: Tag) -> BaseMarker:
             or (ucs4 and (major, minor) >= (3, 3))
         ):
             return EmptyMarker()
+    elif interpreter != "cp" and tag.abi != "none":
+        # Only admit native ABIs whose interpreter identity we can validate.
+        # Matching two arbitrary ABI strings does not make either installable.
+        if interpreter != "pp":
+            return EmptyMarker()
+        abi_match = _PYPY_ABI_RE.fullmatch(tag.abi)
+        if abi_match is None or tuple(map(int, abi_match.groups())) != (major, minor):
+            return EmptyMarker()
     if interpreter == "py":
         if tag.abi != "none":
             return EmptyMarker()
@@ -1027,6 +1037,52 @@ def _resolver_environment() -> dict[str, str]:
     }
 
 
+def _resolver_python_lower_bound(requires_python: str) -> str:
+    """Return a conservative uv lower bound, independent of the build host."""
+    try:
+        specifier = from_specifierset(SpecifierSet(requires_python))
+    except (TypeError, ValueError) as exception:
+        raise SiteBuildError(
+            "invalid Requires-Python for public resolution"
+        ) from exception
+    if isinstance(specifier, UnionSpecifier):
+        specifier = specifier.ranges[0]
+    if not isinstance(specifier, RangeSpecifier) or specifier.min is None:
+        _fail("public resolution requires a finite Python lower bound")
+    lower = specifier.min
+    if lower.epoch or lower.is_prerelease or lower.is_postrelease or lower.local:
+        _fail("public resolution requires a stable Python lower bound")
+    # uv accepts an inclusive major.minor.patch bound. Keep an exclusive endpoint
+    # as a conservative bound; root markers preserve the actual exclusion.
+    # Do not round patch bounds up and omit a supported environment.
+    if len(lower.release) > 3:
+        _fail("public resolution requires a major.minor.patch Python lower bound")
+    return ".".join(map(str, (*lower.release, 0, 0)[:3]))
+
+
+def _resolver_requirements(
+    requirements: tuple[str, ...], requires_python: str
+) -> list[str]:
+    # pip compile does not use project.requires-python. Carry its complete
+    # range on the roots so upper bounds and exclusions constrain the graph.
+    # Keep the original operators: normalizing ~= through a full-version marker
+    # and then serializing it could change the significant release precision.
+    python_condition = " and ".join(
+        f"python_full_version {specifier.operator} {json.dumps(specifier.version)}"
+        for specifier in sorted(SpecifierSet(requires_python), key=str)
+    )
+    result = []
+    for text in requirements:
+        requirement = Requirement(text)
+        requirement.marker = Marker(
+            python_condition
+            if requirement.marker is None
+            else f"({requirement.marker}) and ({python_condition})"
+        )
+        result.append(str(requirement))
+    return result
+
+
 class UvPublicDependencyResolver:
     """Build one universal, exact public dependency closure with uv."""
 
@@ -1101,6 +1157,7 @@ class UvPublicDependencyResolver:
         *,
         requires_python: str,
     ) -> bytes:
+        python_lower_bound = _resolver_python_lower_bound(requires_python)
         try:
             with tempfile.TemporaryDirectory(prefix="vane-public-lock-") as temporary:
                 temporary_root = Path(temporary)
@@ -1116,7 +1173,9 @@ class UvPublicDependencyResolver:
                                 ),
                                 "version": "0",
                                 "requires-python": requires_python,
-                                "dependencies": list(requirements),
+                                "dependencies": _resolver_requirements(
+                                    requirements, requires_python
+                                ),
                             }
                         }
                     ),
@@ -1134,6 +1193,8 @@ class UvPublicDependencyResolver:
                         "compile",
                         str(project_path),
                         "--universal",
+                        "--python-version",
+                        python_lower_bound,
                         "--no-header",
                         "--no-annotate",
                         "--no-strip-markers",
@@ -1552,12 +1613,28 @@ def _pypi_install_arguments(
     )
     if (
         len(root_requirements) != 1
-        or root_requirements[0].marker is not None
         or not root_requirements[0].specifier.contains(
             version_text, prereleases=True
         )
     ):
         _fail(f"PyPI dependency lock omits {distribution_name}")
+    root = root_requirements[0]
+    if root.marker is not None:
+        supported = _python_environment_marker(requires_python, distribution_name)
+        if not intersection(supported, ~from_pkg_marker(root.marker)).is_empty():
+            _fail(
+                "PyPI dependency lock omits supported environments for "
+                f"{distribution_name}"
+            )
+        # Keep the provider itself unconditional so pip reports an unsupported
+        # interpreter instead of silently skipping the entire installation.
+        root.marker = None
+        locked_requirements = tuple(
+            str(root)
+            if canonicalize_name(Requirement(text).name) == root_name
+            else text
+            for text in locked_requirements
+        )
     return _pip_install_arguments(
         _PACKAGE_INDEXES["pypi"]["simple"], locked_requirements
     )

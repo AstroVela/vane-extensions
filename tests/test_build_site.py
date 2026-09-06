@@ -5,7 +5,9 @@ import os
 import shlex
 import subprocess
 import tempfile
+import tomllib
 import unittest
+import zipfile
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -24,7 +26,10 @@ from scripts.build_site import (
     _detail_html,
     _parse_public_lock,
     _powershell_install_script,
+    _pypi_install_arguments,
     _requirement_for_base_install,
+    _resolver_python_lower_bound,
+    _resolver_requirements,
     assemble_site,
     build_details,
 )
@@ -111,6 +116,125 @@ class MetadataClientTests(unittest.TestCase):
 
 
 class PublicDependencyResolverTests(unittest.TestCase):
+    def test_uv_preserves_the_full_python_range_without_using_the_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            index = Path(temporary)
+            package_directory = index / "conditional-package"
+            package_directory.mkdir()
+            filename = "conditional_package-1.0-py3-none-any.whl"
+            with zipfile.ZipFile(package_directory / filename, "w") as wheel:
+                wheel.writestr(
+                    "conditional_package-1.0.dist-info/METADATA",
+                    "Metadata-Version: 2.3\nName: conditional-package\n"
+                    "Version: 1.0\nRequires-Python: >=3.10,<3.12\n",
+                )
+                wheel.writestr(
+                    "conditional_package-1.0.dist-info/WHEEL",
+                    "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+                )
+            (package_directory / "index.html").write_text(
+                f'<a href="{filename}">{filename}</a>', encoding="utf-8"
+            )
+            with patch.dict(
+                "scripts.build_site._PACKAGE_INDEXES",
+                {"pypi": {"simple": index.as_uri() + "/"}},
+            ):
+                locked = UvPublicDependencyResolver().resolve(
+                    (
+                        'conditional-package==1.0; python_version < "3.12"',
+                        'missing-future-package==1.0; python_version >= "3.15"',
+                        'missing-excluded-package==1.0; python_version == "3.13"',
+                    ),
+                    requires_python=">=3.10,!=3.13.*,<3.15",
+                    distribution_name="vane-extension-test",
+                    reject_vane=True,
+                )
+        self.assertEqual(len(locked), 1)
+        requirement = Requirement(locked[0])
+        self.assertEqual(requirement.name, "conditional-package")
+        self.assertEqual(str(requirement.specifier), "==1.0")
+        self.assertIsNotNone(requirement.marker)
+        assert requirement.marker is not None
+        for minor in range(10, 15):
+            with self.subTest(minor=minor):
+                self.assertEqual(
+                    requirement.marker.evaluate(
+                        {
+                            "python_version": f"3.{minor}",
+                            "python_full_version": f"3.{minor}.0",
+                        }
+                    ),
+                    minor < 12,
+                )
+
+    def test_pypi_root_must_cover_every_supported_environment(self) -> None:
+        name = "vane-extension-test"
+        for condition in (None, 'python_full_version < "3.15"'):
+            pin = f"{name}==1.0" + (f"; {condition}" if condition else "")
+            with self.subTest(condition=condition):
+                arguments = _pypi_install_arguments(
+                    name,
+                    "1.0",
+                    {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+                    _FakePublicDependencyResolver((pin,)),
+                )
+                self.assertEqual(arguments[-1], f"{name}==1.0")
+        with self.assertRaisesRegex(SiteBuildError, "omits supported environments"):
+            _pypi_install_arguments(
+                name,
+                "1.0",
+                {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+                _FakePublicDependencyResolver(
+                    (f'{name}==1.0; python_full_version >= "3.12"',)
+                ),
+            )
+
+    def test_python_lower_bound_comes_from_the_full_specifier_set(self) -> None:
+        cases = {
+            ">=3.10,<3.15": "3.10.0",
+            ">=3.10,!=3.10.*,<3.15": "3.11.0",
+            ">=3.10,!=3.11.*,<3.15": "3.10.0",
+            "~=3.10.4": "3.10.4",
+            ">3.10.4": "3.10.4",
+            "==3.10.*": "3.10.0",
+            "==3.10.4": "3.10.4",
+            ">=3": "3.0.0",
+        }
+        for requires_python, expected in cases.items():
+            with self.subTest(requires_python=requires_python):
+                self.assertEqual(
+                    _resolver_python_lower_bound(requires_python), expected
+                )
+
+    def test_resolver_markers_preserve_compatible_release_precision(self) -> None:
+        for requires_python, next_minor_supported in (("~=3.10", True), ("~=3.10.4", False)):
+            with self.subTest(requires_python=requires_python):
+                requirement = Requirement(
+                    _resolver_requirements(("public-package==1",), requires_python)[0]
+                )
+                assert requirement.marker is not None
+                self.assertEqual(
+                    requirement.marker.evaluate({"python_full_version": "3.11.0"}),
+                    next_minor_supported,
+                )
+
+    def test_unusable_python_lower_bounds_fail_before_running_uv(self) -> None:
+        for requires_python in (
+            "", "<3.15", ">=3.12,<3.10", ">=3.10rc1", ">=1!3.10"
+        ):
+            with (
+                self.subTest(requires_python=requires_python),
+                patch("scripts.build_site.subprocess.run") as run_mock,
+                self.assertRaises(SiteBuildError),
+            ):
+                UvPublicDependencyResolver().resolve(
+                    ("public-package>=1",),
+                    requires_python=requires_python,
+                    distribution_name="vane-extension-test",
+                    reject_vane=True,
+                )
+            run_mock.assert_not_called()
+
     def test_lock_parser_accepts_only_exact_public_requirements(self) -> None:
         self.assertEqual(
             _parse_public_lock(
@@ -176,6 +300,21 @@ class PublicDependencyResolverTests(unittest.TestCase):
             )
             self.assertEqual(environment["HTTPS_PROXY"], "https://proxy.invalid")
             self.assertIn("--universal", arguments)
+            self.assertEqual(
+                arguments[arguments.index("--python-version") + 1], "3.10.0"
+            )
+            project = tomllib.loads(
+                (Path(kwargs["cwd"]) / "pyproject.toml").read_text(encoding="utf-8")
+            )
+            dependency = Requirement(project["project"]["dependencies"][0])
+            self.assertEqual(dependency.name, "public-package")
+            assert dependency.marker is not None
+            self.assertFalse(
+                dependency.marker.evaluate({"python_full_version": "3.15.0"})
+            )
+            self.assertTrue(
+                dependency.marker.evaluate({"python_full_version": "3.10.0"})
+            )
             self.assertIn("--no-config", arguments)
             self.assertIn("--no-cache", arguments)
             self.assertIn("--only-binary=:all:", arguments)
@@ -1219,6 +1358,10 @@ class BuildSiteTests(unittest.TestCase):
             "unsupported-native-ABI": "cp310-unknown-manylinux_2_28_x86_64",
             "premature-free-threaded-ABI": "cp310-cp310t-manylinux_2_28_x86_64",
             "native-ABI-with-universal-platform": "cp310-cp310-any",
+            "cpython-ABI-on-pypy": "pp310-cp310-manylinux_2_28_x86_64",
+            "mismatched-pypy-ABI": "pp310-pypy39_pp73-manylinux_2_28_x86_64",
+            "unknown-pypy-ABI": "pp310-unknown-manylinux_2_28_x86_64",
+            "cpython-ABI-on-other-interpreter": "ip310-cp310-win_amd64",
         }
 
         for case, wheel_tag in incompatible_tags.items():
@@ -1324,6 +1467,10 @@ class BuildSiteTests(unittest.TestCase):
             "debug-and-release-ABI": (
                 "cp310-cp310d-manylinux_2_28_x86_64",
                 "cp310-cp310-manylinux_2_28_x86_64",
+            ),
+            "pypy-native-ABI": (
+                "py3-none-any",
+                "pp310-pypy310_pp73-manylinux_2_28_x86_64",
             ),
         }
 

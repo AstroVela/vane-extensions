@@ -69,6 +69,13 @@ closure from PyPI with dependency resolution disabled before installing the
 exact Vane and extension wheels from TestPyPI the same way. Both steps force
 reinstallation so a matching distribution already present from another source
 cannot satisfy either step.
+The universal resolver receives an explicit lower Python bound derived by
+`dep-logic` from the provider's complete `Requires-Python` specifier set, so a
+newer build interpreter cannot silently drop older-Python conditional
+dependencies. An absent or unsupported lower bound fails the build.
+Root requirement markers also carry the complete Python range, including upper
+bounds and excluded versions, instead of relying on temporary project metadata
+that `uv pip compile` does not apply to its universal resolution.
 The site build fails closed if the provider or any selected Vane-owned
 dependency lacks a non-yanked wheel, if an applicable internal release shares no
 Python, ABI, and platform environment with a provider wheel, or if the public
@@ -84,7 +91,9 @@ release must also support every Python environment in that range where its
 incoming condition is active; an incompatible `Requires-Python` closure fails
 the build. A bounded search also requires a common environment for the entire
 internal wheel closure, including the effective conditions of each release;
-pairwise overlap alone is insufficient. Direct-URL requirements are omitted
+pairwise overlap alone is insufficient. Native ABI validation currently covers
+CPython and PyPy; other interpreter families require ABI-independent (`none`)
+wheels. Direct-URL requirements are omitted
 from published JSON and HTML so artifact locations or embedded credentials
 cannot leak through package metadata.
 
