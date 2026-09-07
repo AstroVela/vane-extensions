@@ -31,6 +31,7 @@ from scripts.build_site import (
     _requirement_for_base_install,
     _resolver_python_lower_bound,
     _resolver_requirements,
+    _wheel_platform_environment,
     assemble_site,
     build_details,
 )
@@ -1502,6 +1503,7 @@ class BuildSiteTests(unittest.TestCase):
             "mismatched-pypy-ABI": "pp310-pypy39_pp73-manylinux_2_28_x86_64",
             "unknown-pypy-ABI": "pp310-unknown-manylinux_2_28_x86_64",
             "cpython-ABI-on-other-interpreter": "ip310-cp310-win_amd64",
+            "unknown-Windows-architecture": "py3-none-win_bogus",
         }
 
         for case, wheel_tag in incompatible_tags.items():
@@ -1532,6 +1534,28 @@ class BuildSiteTests(unittest.TestCase):
                     client=_FakeMetadataClient(responses),
                     public_resolver=_FakePublicDependencyResolver(()),
                 )
+
+    def test_windows_platform_model_rejects_unknown_architectures(self) -> None:
+        for platform_tag, machine in (
+            ("win32", "x86"),
+            ("win_amd64", "AMD64"),
+            ("win_arm64", "ARM64"),
+        ):
+            with self.subTest(platform_tag=platform_tag):
+                environment = _wheel_platform_environment(platform_tag)
+                self.assertTrue(
+                    environment.evaluate(
+                        {
+                            "os_name": "nt",
+                            "sys_platform": "win32",
+                            "platform_system": "Windows",
+                            "platform_machine": machine,
+                        }
+                    )
+                )
+        for platform_tag in ("win_bogus", "win_", "win_x86_64", "win_amd64_extra"):
+            with self.subTest(platform_tag=platform_tag):
+                self.assertTrue(_wheel_platform_environment(platform_tag).is_empty())
 
     def test_registry_platform_scope_is_explicit_for_non_desktop_wheels(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))

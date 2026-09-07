@@ -733,10 +733,9 @@ def _platform_shape(platform_tag: str) -> tuple[str, frozenset[str]]:
         return "windows", frozenset(("x86",))
     if platform_tag.startswith("win_"):
         architecture = platform_tag.removeprefix("win_")
-        machine = {"amd64": "AMD64", "arm64": "ARM64"}.get(
-            architecture, architecture
-        )
-        return "windows", frozenset((machine,))
+        machine = {"amd64": "AMD64", "arm64": "ARM64"}.get(architecture)
+        if machine is not None:
+            return "windows", frozenset((machine,))
     macos_architectures = _macos_architectures(platform_tag)
     if macos_architectures:
         return "macos", macos_architectures
