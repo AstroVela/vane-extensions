@@ -81,11 +81,33 @@ _VERSIONED_INTERPRETER_TAG_RE = re.compile(
 )
 _CPYTHON_ABI_RE = re.compile(r"cp([0-9])([0-9]+)(t?)(d?)(m?)(u?)")
 _PYPY_ABI_RE = re.compile(r"pypy([0-9])([0-9]+)_pp[0-9]+")
+# Bounded, canonical policy versions: leading zeroes are not emitted by pip's
+# tag generation. Keep remote metadata from driving unbounded version loops.
+_PLATFORM_VERSION = r"(?:0|[1-9][0-9]?)"
 _LINUX_PLATFORM_RE = re.compile(
-    r"^(manylinux(?:_[0-9]+_[0-9]+|1|2010|2014)|"
-    r"musllinux_[0-9]+_[0-9]+|linux)_(.+)$"
+    rf"^(manylinux(?:_{_PLATFORM_VERSION}_{_PLATFORM_VERSION}|1|2010|2014)|"
+    rf"musllinux_{_PLATFORM_VERSION}_{_PLATFORM_VERSION}|linux)_(.+)$"
 )
-_MACOS_PLATFORM_RE = re.compile(r"^macosx_([0-9]+)_([0-9]+)_(.+)$")
+_MACOS_PLATFORM_RE = re.compile(
+    rf"^macosx_({_PLATFORM_VERSION})_({_PLATFORM_VERSION})_(.+)$"
+)
+# packaging 26.3's _manylinux._have_compatible_abi targets. Its Linux tag
+# generator inspects the running ELF/libc, so it cannot validate remote wheels
+# through a public cross-platform API as mac_platforms() does for macOS.
+_MANYLINUX_ARCHITECTURES = frozenset(
+    (
+        "x86_64",
+        "i686",
+        "aarch64",
+        "armv7l",
+        "ppc64",
+        "ppc64le",
+        "s390x",
+        "loongarch64",
+        "riscv64",
+    )
+)
+_LINUX_ARCHITECTURES = _MANYLINUX_ARCHITECTURES | {"i386", "armv6l"}
 _UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
@@ -695,25 +717,44 @@ def _macos_architectures(platform_tag: str) -> frozenset[str]:
     match = _MACOS_PLATFORM_RE.fullmatch(platform_tag)
     if match is None:
         return frozenset()
-    major, minor, wheel_architecture = match.groups()
+    major, minor, _wheel_architecture = match.groups()
     major_version = int(major)
     minor_version = int(minor)
-    if major_version > 99 or minor_version > 99:
-        return frozenset()
     target_version = (
         max(major_version, 11),
         0 if major_version >= 11 else minor_version,
     )
-    architectures = frozenset(
+    return frozenset(
         architecture
         for architecture in ("arm64", "x86_64")
         if platform_tag in set(mac_platforms(target_version, architecture))
     )
-    if architectures:
-        return architectures
-    if wheel_architecture in {"arm64", "x86_64"}:
-        return frozenset((wheel_architecture,))
-    return frozenset()
+
+
+def _linux_platform_family(policy: str, architecture: str) -> str | None:
+    if architecture not in _LINUX_ARCHITECTURES:
+        return None
+    if policy == "linux":
+        return "linux-any"
+    if policy.startswith("musllinux_"):
+        major_version = int(policy.split("_")[1])
+        # packaging emits musllinux tags only for the running musl major.
+        return f"linux-musl-{major_version}" if major_version >= 1 else None
+    if architecture not in _MANYLINUX_ARCHITECTURES:
+        return None
+    if policy in {"manylinux1", "manylinux2010"}:
+        return "linux-glibc" if architecture in {"x86_64", "i686"} else None
+    if policy == "manylinux2014":
+        return (
+            "linux-glibc"
+            if architecture not in {"loongarch64", "riscv64"}
+            else None
+        )
+    _manylinux, major, minor = policy.split("_")
+    minimum_minor = 5 if architecture in {"x86_64", "i686"} else 17
+    if (int(major), int(minor)) < (2, minimum_minor):
+        return None
+    return "linux-glibc"
 
 
 def _platform_shape(platform_tag: str) -> tuple[str, frozenset[str]]:
@@ -722,13 +763,9 @@ def _platform_shape(platform_tag: str) -> tuple[str, frozenset[str]]:
     linux_match = _LINUX_PLATFORM_RE.fullmatch(platform_tag)
     if linux_match is not None:
         policy, architecture = linux_match.groups()
-        if policy.startswith("manylinux"):
-            family = "linux-glibc"
-        elif policy.startswith("musllinux"):
-            family = "linux-musl"
-        else:
-            family = "linux-any"
-        return family, frozenset((architecture,))
+        family = _linux_platform_family(policy, architecture)
+        if family is not None:
+            return family, frozenset((architecture,))
     if platform_tag == "win32":
         return "windows", frozenset(("x86",))
     if platform_tag.startswith("win_"):

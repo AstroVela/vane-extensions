@@ -26,6 +26,7 @@ from scripts.build_site import (
     _abi_tags_overlap,
     _detail_html,
     _parse_public_lock,
+    _platform_tags_overlap,
     _powershell_install_script,
     _pypi_install_arguments,
     _requirement_for_base_install,
@@ -1504,6 +1505,14 @@ class BuildSiteTests(unittest.TestCase):
             "unknown-pypy-ABI": "pp310-unknown-manylinux_2_28_x86_64",
             "cpython-ABI-on-other-interpreter": "ip310-cp310-win_amd64",
             "unknown-Windows-architecture": "py3-none-win_bogus",
+            "unknown-manylinux-architecture": "py3-none-manylinux_2_28_bogus",
+            "unknown-musllinux-architecture": "py3-none-musllinux_1_2_bogus",
+            "unknown-Linux-architecture": "py3-none-linux_bogus",
+            "noncanonical-manylinux-version": "py3-none-manylinux_02_28_x86_64",
+            "unsupported-manylinux-baseline": "py3-none-manylinux_2_4_x86_64",
+            "unsupported-legacy-manylinux": "py3-none-manylinux1_aarch64",
+            "premature-macOS-arm64": "py3-none-macosx_10_9_arm64",
+            "invalid-macOS-version": "py3-none-macosx_11_3_x86_64",
         }
 
         for case, wheel_tag in incompatible_tags.items():
@@ -1534,6 +1543,121 @@ class BuildSiteTests(unittest.TestCase):
                     client=_FakeMetadataClient(responses),
                     public_resolver=_FakePublicDependencyResolver(()),
                 )
+
+    def test_linux_platform_model_validates_architectures_and_policies(self) -> None:
+        manylinux_architectures = (
+            "x86_64",
+            "i686",
+            "aarch64",
+            "armv7l",
+            "ppc64",
+            "ppc64le",
+            "s390x",
+            "loongarch64",
+            "riscv64",
+        )
+        supported = [
+            (f"{policy}_{architecture}", architecture)
+            for policy in ("manylinux_2_28", "musllinux_1_2", "linux")
+            for architecture in manylinux_architectures
+        ] + [
+            ("manylinux1_i686", "i686"),
+            ("manylinux2010_x86_64", "x86_64"),
+            ("manylinux2014_aarch64", "aarch64"),
+            ("manylinux_2_5_x86_64", "x86_64"),
+            ("manylinux_2_17_armv7l", "armv7l"),
+            ("musllinux_1_0_x86_64", "x86_64"),
+            ("linux_i386", "i386"),
+            ("linux_armv6l", "armv6l"),
+        ]
+        for platform_tag, machine in supported:
+            with self.subTest(platform_tag=platform_tag):
+                self.assertTrue(
+                    _wheel_platform_environment(platform_tag).evaluate(
+                        {
+                            "os_name": "posix",
+                            "sys_platform": "linux",
+                            "platform_system": "Linux",
+                            "platform_machine": machine,
+                        }
+                    )
+                )
+        unsupported = [
+            f"{policy}_{architecture}"
+            for policy in ("manylinux_2_28", "manylinux2014", "musllinux_1_2", "linux")
+            for architecture in ("bogus", "amd64", "arm64", "x86_64_extra", "")
+        ] + [
+            "manylinux1_aarch64",
+            "manylinux2010_ppc64le",
+            "manylinux2014_loongarch64",
+            "manylinux2014_riscv64",
+            "manylinux_2_28_i386",
+            "manylinux_2_28_armv6l",
+            "manylinux_1_99_x86_64",
+            "manylinux_2_4_x86_64",
+            "manylinux_2_16_aarch64",
+            "manylinux_02_28_x86_64",
+            "manylinux_2_028_x86_64",
+            "musllinux_0_2_x86_64",
+            "musllinux_01_2_x86_64",
+            "musllinux_1_02_x86_64",
+            "manylinux_2_100_x86_64",
+            "musllinux_1_100_x86_64",
+        ]
+        for platform_tag in unsupported:
+            with self.subTest(platform_tag=platform_tag):
+                self.assertTrue(_wheel_platform_environment(platform_tag).is_empty())
+
+    def test_linux_wheel_overlap_respects_libc_family_and_musl_major(self) -> None:
+        for left, right, expected in (
+            ("manylinux1_x86_64", "manylinux_2_28_x86_64", True),
+            ("manylinux_2_28_x86_64", "musllinux_1_2_x86_64", False),
+            ("musllinux_1_1_x86_64", "musllinux_1_2_x86_64", True),
+            ("musllinux_1_2_x86_64", "musllinux_2_0_x86_64", False),
+            ("linux_x86_64", "musllinux_2_0_x86_64", True),
+            ("linux_x86_64", "manylinux_2_28_aarch64", False),
+        ):
+            with self.subTest(left=left, right=right):
+                self.assertEqual(_platform_tags_overlap(left, right), expected)
+                self.assertEqual(_platform_tags_overlap(right, left), expected)
+
+    def test_macos_platform_model_requires_a_generated_tag(self) -> None:
+        for platform_tag, machines in (
+            ("macosx_10_4_x86_64", {"x86_64"}),
+            ("macosx_10_16_x86_64", {"x86_64"}),
+            ("macosx_10_9_universal2", {"x86_64", "arm64"}),
+            ("macosx_10_9_intel", {"x86_64"}),
+            ("macosx_11_0_arm64", {"arm64"}),
+            ("macosx_26_0_universal2", {"x86_64", "arm64"}),
+        ):
+            for machine in ("x86_64", "arm64", "bogus"):
+                with self.subTest(platform_tag=platform_tag, machine=machine):
+                    self.assertEqual(
+                        _wheel_platform_environment(platform_tag).evaluate(
+                            {
+                                "os_name": "posix",
+                                "sys_platform": "darwin",
+                                "platform_system": "Darwin",
+                                "platform_machine": machine,
+                            }
+                        ),
+                        machine in machines,
+                    )
+        for platform_tag in (
+            "macosx_0_0_arm64",
+            "macosx_9_9_x86_64",
+            "macosx_10_3_x86_64",
+            "macosx_10_9_arm64",
+            "macosx_10_17_x86_64",
+            "macosx_11_3_x86_64",
+            "macosx_11_1_arm64",
+            "macosx_011_0_arm64",
+            "macosx_11_00_arm64",
+            "macosx_11_0_bogus",
+            "macosx_100_0_arm64",
+        ):
+            with self.subTest(platform_tag=platform_tag):
+                self.assertTrue(_wheel_platform_environment(platform_tag).is_empty())
 
     def test_windows_platform_model_rejects_unknown_architectures(self) -> None:
         for platform_tag, machine in (
