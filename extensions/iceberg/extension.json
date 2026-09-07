@@ -5,5 +5,14 @@
   "description": "Read and write Apache Iceberg tables from Vane.",
   "repository": "https://github.com/AstroVela/duckdb-iceberg",
   "publisher": "AstroVela",
-  "license": "MIT"
+  "license": "MIT",
+  "maintainers": [
+    "AstroVela"
+  ],
+  "package_index": "testpypi",
+  "documentation": {
+    "url": "https://github.com/AstroVela/duckdb-iceberg/tree/v1.5-variegata_vane",
+    "hello_world": "SELECT * FROM iceberg_scan('path/to/iceberg/table');",
+    "extended_description": "Query and mutate Apache Iceberg tables from Vane. The provider supports Vane-specific distributed scan and mutation paths while preserving Iceberg catalog transactions as the commit authority."
+  }
 }

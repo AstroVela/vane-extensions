@@ -5,5 +5,14 @@
   "description": "Read and write Lance tables from Vane.",
   "repository": "https://github.com/AstroVela/lance-duckdb",
   "publisher": "AstroVela",
-  "license": "Apache-2.0"
+  "license": "Apache-2.0",
+  "maintainers": [
+    "AstroVela"
+  ],
+  "package_index": "testpypi",
+  "documentation": {
+    "url": "https://github.com/AstroVela/lance-duckdb/tree/main_vane/docs",
+    "hello_world": "SELECT * FROM 'path/to/dataset.lance' LIMIT 10;",
+    "extended_description": "Read and write Lance datasets from Vane, including distributed scans and mutations. Lance is a columnar format designed for machine-learning data and provides vector, full-text, and hybrid search capabilities."
+  }
 }
