@@ -812,6 +812,66 @@ class BuildSiteTests(unittest.TestCase):
         self.assertNotIn("files.example", serialized)
         self.assertNotIn("not-published-by-the-registry", serialized)
 
+    def test_github_repository_casing_does_not_change_identity(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        canonical_repository = str(manifest["repository"])
+        slug = canonical_repository.removeprefix("https://github.com/")
+        for manifest_slug in (slug.lower(), slug.upper(), slug.swapcase()):
+            with self.subTest(manifest_slug=manifest_slug):
+                manifest["repository"] = f"https://github.com/{manifest_slug}"
+                responses = {
+                    f"https://api.github.com/repos/{manifest_slug}": _github_response(
+                        canonical_repository
+                    ),
+                    f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                        distribution
+                    ),
+                }
+                detail = build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=_FakeMetadataClient(responses),
+                )[0]
+                self.assertEqual(detail["source"], {"github_stars": 7})
+                self.assertEqual(detail["repository"], manifest["repository"])
+
+    def test_github_metadata_rejects_mismatched_or_noncanonical_identity(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        invalid_values = (
+            ("full_name", "another-owner/another-repo"),
+            ("full_name", slug.replace("AstroVela", "AſtroVela")),
+            ("html_url", "https://github.com/another-owner/another-repo"),
+            ("html_url", repository.replace("https:", "http:")),
+            ("html_url", repository.replace("https:", "httpſ:")),
+            ("html_url", repository.replace("github.com", "github.example")),
+            ("html_url", repository.replace("github.com", "user@github.com")),
+            ("html_url", repository.replace("github.com", "github.com:443")),
+            ("html_url", f"{repository}?tab=readme-ov-file"),
+            ("html_url", f"{repository}#readme"),
+            ("html_url", f"{repository}/"),
+            ("html_url", None),
+        )
+        for field, value in invalid_values:
+            with self.subTest(field=field, value=value):
+                github_response = _github_response(repository)
+                github_response[field] = value
+                responses = {
+                    f"https://api.github.com/repos/{slug}": github_response,
+                    f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                        distribution
+                    ),
+                }
+                with self.assertRaises(SiteBuildError):
+                    build_details(
+                        manifest_root=self._single_manifest_root(manifest),
+                        generated_at=GENERATED_AT,
+                        client=_FakeMetadataClient(responses),
+                    )
+
     def test_generic_python_wheel_tags_preserve_exact_and_broad_support(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
         distribution = str(manifest["distribution_name"])

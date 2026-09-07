@@ -299,8 +299,13 @@ def _github_metadata(
     stars = document.get("stargazers_count")
     if (
         not isinstance(full_name, str)
+        or not full_name.isascii()
         or full_name.casefold() != slug.casefold()
-        or html_url != repository
+        or not isinstance(html_url, str)
+        or not html_url.isascii()
+        # The manifest URL is already canonical. Only ASCII case differences
+        # in GitHub's canonical owner/repository spelling identify the same URL.
+        or html_url.casefold() != repository.casefold()
     ):
         _fail(f"GitHub metadata identity does not match {repository}")
     if type(stars) is not int or stars < 0:
