@@ -16,6 +16,7 @@ import tempfile
 from collections.abc import Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import copy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -66,6 +67,15 @@ _LOGGER = logging.getLogger(__name__)
 # A tag may occur in several files. Its value is the union of those files'
 # tag/Python environments, not the release-wide Requires-Python alone.
 WheelEnvironments = Mapping[Tag, BaseMarker]
+
+
+@dataclass(frozen=True)
+class _PlatformPolicy:
+    family: str
+    architectures: frozenset[str]
+    minimum_version: tuple[int, int] | None = None
+
+
 DETAIL_MAX_JSON_BYTES = 1024 * 1024
 AGGREGATE_MAX_JSON_BYTES = 8 * 1024 * 1024
 REMOTE_METADATA_MAX_BYTES = 8 * 1024 * 1024
@@ -760,22 +770,34 @@ def _macos_architectures(platform_tag: str) -> frozenset[str]:
     )
 
 
-def _linux_platform_family(policy: str, architecture: str) -> str | None:
+def _linux_platform_policy(policy: str, architecture: str) -> _PlatformPolicy | None:
     if architecture not in _LINUX_ARCHITECTURES:
         return None
+    architectures = frozenset((architecture,))
     if policy == "linux":
-        return "linux-any"
+        return _PlatformPolicy("linux-any", architectures)
     if policy.startswith("musllinux_"):
-        major_version = int(policy.split("_")[1])
+        _, major, minor = policy.split("_")
+        version = (int(major), int(minor))
         # packaging emits musllinux tags only for the running musl major.
-        return f"linux-musl-{major_version}" if major_version >= 1 else None
+        return (
+            _PlatformPolicy(f"linux-musl-{version[0]}", architectures, version)
+            if version[0] >= 1
+            else None
+        )
     if architecture not in _MANYLINUX_ARCHITECTURES:
         return None
     if policy in {"manylinux1", "manylinux2010"}:
-        return "linux-glibc" if architecture in {"x86_64", "i686"} else None
+        if architecture not in {"x86_64", "i686"}:
+            return None
+        return _PlatformPolicy(
+            "linux-glibc",
+            architectures,
+            (2, 5) if policy == "manylinux1" else (2, 12),
+        )
     if policy == "manylinux2014":
         return (
-            "linux-glibc"
+            _PlatformPolicy("linux-glibc", architectures, (2, 17))
             if architecture not in {"loongarch64", "riscv64"}
             else None
         )
@@ -783,33 +805,36 @@ def _linux_platform_family(policy: str, architecture: str) -> str | None:
     minimum_minor = 5 if architecture in {"x86_64", "i686"} else 17
     if (int(major), int(minor)) < (2, minimum_minor):
         return None
-    return "linux-glibc"
+    return _PlatformPolicy("linux-glibc", architectures, (int(major), int(minor)))
 
 
-def _platform_shape(platform_tag: str) -> tuple[str, frozenset[str]]:
+@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT)
+def _platform_shape(platform_tag: str) -> _PlatformPolicy:
     if platform_tag == "any":
-        return "any", frozenset()
+        return _PlatformPolicy("any", frozenset())
     linux_match = _LINUX_PLATFORM_RE.fullmatch(platform_tag)
     if linux_match is not None:
         policy, architecture = linux_match.groups()
-        family = _linux_platform_family(policy, architecture)
-        if family is not None:
-            return family, frozenset((architecture,))
+        support = _linux_platform_policy(policy, architecture)
+        if support is not None:
+            return support
     if platform_tag == "win32":
-        return "windows", frozenset(("x86",))
+        return _PlatformPolicy("windows", frozenset(("x86",)))
     if platform_tag.startswith("win_"):
         architecture = platform_tag.removeprefix("win_")
         machine = {"amd64": "AMD64", "arm64": "ARM64"}.get(architecture)
         if machine is not None:
-            return "windows", frozenset((machine,))
+            return _PlatformPolicy("windows", frozenset((machine,)))
     macos_architectures = _macos_architectures(platform_tag)
     if macos_architectures:
-        return "macos", macos_architectures
-    return f"exact:{platform_tag}", frozenset()
+        _, major, minor, _architecture = platform_tag.split("_", 3)
+        return _PlatformPolicy("macos", macos_architectures, (int(major), int(minor)))
+    return _PlatformPolicy(f"exact:{platform_tag}", frozenset())
 
 
 def _wheel_platform_environment(platform_tag: str) -> BaseMarker:
-    family, architectures = _platform_shape(platform_tag)
+    policy = _platform_shape(platform_tag)
+    family, architectures = policy.family, policy.architectures
     if family == "any":
         return AnyMarker()
     if family.startswith("linux-"):
@@ -832,15 +857,16 @@ def _wheel_platform_environment(platform_tag: str) -> BaseMarker:
 
 
 def _platform_tags_overlap(left: str, right: str) -> bool:
-    left_family, left_architectures = _platform_shape(left)
-    right_family, right_architectures = _platform_shape(right)
+    left_policy, right_policy = _platform_shape(left), _platform_shape(right)
+    left_family, left_architectures = left_policy.family, left_policy.architectures
+    right_family, right_architectures = right_policy.family, right_policy.architectures
     if "any" in {left_family, right_family}:
         return True
     if left_family.startswith("linux-") and right_family.startswith("linux-"):
-        libc_compatible = (
-            left_family == right_family
-            or "linux-any" in {left_family, right_family}
-        )
+        libc_compatible = left_family == right_family or "linux-any" in {
+            left_family,
+            right_family,
+        }
         return libc_compatible and bool(left_architectures & right_architectures)
     if left_family != right_family:
         return False
@@ -849,27 +875,89 @@ def _platform_tags_overlap(left: str, right: str) -> bool:
     return left_family == right_family
 
 
+@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT * 4)
+def _platform_coverage_environment(provider: str, dependency: str) -> BaseMarker:
+    """Restrict coverage to architectures installable at the provider's floor."""
+    required = _platform_shape(dependency)
+    if required.family == "any":
+        return AnyMarker()
+    if not _platform_tags_overlap(provider, dependency):
+        return EmptyMarker()
+    if required.minimum_version is None:
+        return _wheel_platform_environment(dependency)
+    supported = _platform_shape(provider)
+    if supported.minimum_version is None:
+        # Neither an any wheel nor generic linux tag promises a minimum libc
+        # or macOS version that could justify a versioned dependency floor.
+        return EmptyMarker()
+    if supported.family == "macos":
+        # universal2 can advertise macOS 10.x on x86-64 while its Arm64 half
+        # starts at 11.0. Let packaging decide membership at each real floor.
+        architectures = frozenset(
+            architecture
+            for architecture in supported.architectures & required.architectures
+            if dependency
+            in mac_platforms(
+                max(supported.minimum_version, (11, 0))
+                if architecture == "arm64"
+                else supported.minimum_version,
+                architecture,
+            )
+        )
+        if not architectures:
+            return EmptyMarker()
+        return intersection(
+            _wheel_platform_environment(dependency),
+            _one_of_marker("platform_machine", architectures),
+        )
+    if (
+        supported.family == required.family
+        and required.minimum_version <= supported.minimum_version
+    ):
+        return _wheel_platform_environment(dependency)
+    return EmptyMarker()
+
+
+@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT)
+def _native_abi_accepts(runtime_abi: str, required_abi: str) -> bool:
+    if required_abi == "none" or runtime_abi == required_abi:
+        return True
+    match = _CPYTHON_ABI_RE.fullmatch(runtime_abi)
+    if match is None:
+        return False
+    major, minor, _threaded, debug, _pymalloc, _ucs4 = match.groups()
+    version = (int(major), int(minor))
+    if version[1] > 99:
+        return False
+    abis = [runtime_abi]
+    if debug and version >= (3, 8):
+        abis.append(runtime_abi.removesuffix("d"))
+    return any(
+        tag.abi == required_abi
+        for tag in cpython_tags(version, abis=abis, platforms=("any",))
+    )
+
+
 @lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT)
 def _abi_tags_overlap(left: str, right: str) -> bool:
-    if left == "none" or right == "none" or left == right:
+    if left == "none" or right == "none":
         return True
-    for runtime_abi, required_abi in ((left, right), (right, left)):
-        match = _CPYTHON_ABI_RE.fullmatch(runtime_abi)
-        if match is None:
-            continue
-        major, minor, _threaded, debug, _pymalloc, _ucs4 = match.groups()
-        version = (int(major), int(minor))
-        if version[1] > 99:
-            continue
-        abis = [runtime_abi]
-        if debug and version >= (3, 8):
-            abis.append(runtime_abi.removesuffix("d"))
-        if any(
-            tag.abi == required_abi
-            for tag in cpython_tags(version, abis=abis, platforms=("any",))
-        ):
-            return True
-    return False
+    return _native_abi_accepts(left, right) or _native_abi_accepts(right, left)
+
+
+def _wheel_coverage_environment(provider: Tag, dependency: Tag) -> BaseMarker:
+    if not _abi_tags_overlap(provider.abi, dependency.abi):
+        return EmptyMarker()
+    if _CPYTHON_ABI_RE.fullmatch(provider.abi):
+        if not _native_abi_accepts(provider.abi, dependency.abi):
+            return EmptyMarker()
+    elif provider.abi in {"abi3", "abi3t"}:
+        native_dependency = _CPYTHON_ABI_RE.fullmatch(dependency.abi)
+        if native_dependency is not None and native_dependency.group(4):
+            # Stable ABI support includes non-debug runtimes too; a debug-only
+            # wheel cannot cover them just because both work on debug Python.
+            return EmptyMarker()
+    return _platform_coverage_environment(provider.platform, dependency.platform)
 
 
 def _wheel_tag_environment(tag: Tag) -> BaseMarker:
@@ -919,6 +1007,7 @@ def _dependency_wheels_cover_provider(
                 remaining,
                 dependency_python_environment,
                 dependency_file_environment,
+                _wheel_coverage_environment(provider_tag, dependency_tag),
             )
             if shared.is_empty():
                 continue
@@ -949,15 +1038,21 @@ def _validate_wheel_closure(
             f"wheel closure must contain one provider release for {distribution_name}"
         )
     root_key = root_keys[0]
-    remaining = intersection(
-        environment,
-        release_python_environments[root_key],
-        MarkerUnion.of(*release_wheel_tags[root_key].values()),
+    provider_environments = tuple(
+        (
+            tag,
+            intersection(
+                environment, release_python_environments[root_key], file_environment
+            ),
+        )
+        for tag, file_environment in sorted(
+            release_wheel_tags[root_key].items(), key=lambda item: str(item[0])
+        )
     )
-    if remaining.is_empty():
+    if not any(not supported.is_empty() for _, supported in provider_environments):
         _fail(f"{distribution_name} wheel closure has no common environment")
     releases = sorted(
-        selected_conditions,
+        selected_conditions.keys() - {root_key},
         key=lambda key: (
             not selected_conditions[key].is_any(),
             len(release_wheel_tags[key]),
@@ -979,7 +1074,10 @@ def _validate_wheel_closure(
     remaining_steps = WHEEL_CLOSURE_MAX_STEPS
 
     def search(
-        offset: int, environment: BaseMarker, selected_tags: tuple[Tag, ...]
+        offset: int,
+        environment: BaseMarker,
+        selected_tags: tuple[Tag, ...],
+        provider_tag: Tag,
     ) -> BaseMarker:
         nonlocal remaining_steps
         remaining_steps -= 1
@@ -994,7 +1092,7 @@ def _validate_wheel_closure(
         if not condition.is_any():
             inactive = intersection(environment, ~condition)
             if not inactive.is_empty():
-                solution = search(offset + 1, inactive, selected_tags)
+                solution = search(offset + 1, inactive, selected_tags, provider_tag)
                 if not solution.is_empty():
                     return solution
         active = intersection(environment, condition)
@@ -1010,24 +1108,31 @@ def _validate_wheel_closure(
                 _wheel_tags_overlap(tag, selected) for selected in selected_tags
             ):
                 continue
-            shared = intersection(active, wheel_environment)
+            shared = intersection(
+                active,
+                wheel_environment,
+                _wheel_coverage_environment(provider_tag, tag),
+            )
             if not shared.is_empty():
-                solution = search(offset + 1, shared, (*selected_tags, tag))
+                solution = search(
+                    offset + 1, shared, (*selected_tags, tag), provider_tag
+                )
                 if not solution.is_empty():
                     return solution
         return EmptyMarker()
 
-    # One solution can cover a whole symbolic region. Remove that region and
-    # repeat until every provider environment is covered, using one shared
-    # budget so a large or conflicting graph still fails with bounded work.
-    while not remaining.is_empty():
-        solution = search(0, remaining, ())
-        if solution.is_empty():
-            _fail(
-                f"{distribution_name} wheel closure has no common environment "
-                "for some supported provider environments"
-            )
-        remaining = intersection(remaining, ~solution)
+    # Keep each provider tag fixed: merging its marker environments would lose
+    # libc/deployment floors and ABI identity. Subtract covered regions under
+    # each tag with one shared budget across the entire validation.
+    for provider_tag, remaining in provider_environments:
+        while not remaining.is_empty():
+            solution = search(0, remaining, (provider_tag,), provider_tag)
+            if solution.is_empty():
+                _fail(
+                    f"{distribution_name} wheel closure has no common environment "
+                    "for some supported provider environments"
+                )
+            remaining = intersection(remaining, ~solution)
 
 
 def _conditioned_requirement(

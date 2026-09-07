@@ -113,14 +113,21 @@ Native ABI validation covers CPython and PyPy's documented `pp73` ABI revision;
 other interpreter families require ABI-independent (`none`) wheels. The
 free-threaded Stable ABI (`abi3t`) requires runtime 3.15 or later,
 following PEP 803's supported builds; experimental backports are not promised.
+Native provider ABIs are checked directionally with `packaging.cpython_tags`;
+debug-only dependencies cannot cover a non-debug native or Stable ABI provider.
 Installability checks currently model Linux, macOS, and Windows host families,
 matching the OS families handled by Vane's extension-wheel platform policies.
 Platform-independent (`any`) dependency wheels are supported too. Versioned
 platform policies must use canonical version components from 0 through 99.
 Linux architecture names are allowlisted; manylinux's architecture-specific
 minimum glibc versions and legacy targets are checked, and musllinux wheels
-must share one musl major version. macOS tags must be emitted by `packaging` for
-an x86-64 or Arm64 runtime, including supported multi-architecture tags.
+must share one musl major version. Dependency libc floors must be no newer than
+the provider's floor; a generic Linux tag cannot establish a versioned libc
+baseline. macOS tags must be emitted by `packaging` for an x86-64 or Arm64
+runtime at the provider's minimum deployment target. For `universal2`, the Arm64
+floor is at least 11.0 even when the x86-64 half supports an older release.
+The joint dependency search retains each provider tag and its platform floor,
+so it cannot combine sibling wheels that work together only on newer systems.
 Other valid Python wheel platforms (such as Android, iOS, Emscripten, AIX, and
 FreeBSD) may appear in informational package metadata, but cannot establish an installable
 registry environment. A release available only on such platforms fails the

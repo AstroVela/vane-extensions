@@ -2025,10 +2025,10 @@ class BuildSiteTests(unittest.TestCase):
                 distribution
             ),
         }
-        # Three steps find the first wheel's region, but must not give the
+        # One step covers the first root-only region, but must not give the
         # second provider region a fresh budget.
         with (
-            patch("scripts.build_site.WHEEL_CLOSURE_MAX_STEPS", 3),
+            patch("scripts.build_site.WHEEL_CLOSURE_MAX_STEPS", 1),
             self.assertRaisesRegex(SiteBuildError, "search is too complex"),
         ):
             build_details(
@@ -2225,6 +2225,191 @@ class BuildSiteTests(unittest.TestCase):
                 self.assertEqual(_platform_tags_overlap(left, right), expected)
                 self.assertEqual(_platform_tags_overlap(right, left), expected)
 
+    def test_dependency_platform_floors_cover_the_provider_directionally(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        cases = (
+            ("manylinux_2_17_x86_64", "manylinux_2_28_x86_64", False),
+            ("manylinux_2_28_x86_64", "manylinux_2_17_x86_64", True),
+            ("manylinux2014_x86_64", "manylinux_2_17_x86_64", True),
+            ("manylinux1_x86_64", "manylinux2010_x86_64", False),
+            ("manylinux2010_x86_64", "manylinux1_x86_64", True),
+            ("manylinux2014_x86_64", "manylinux_2_28_x86_64", False),
+            ("musllinux_1_1_x86_64", "musllinux_1_2_x86_64", False),
+            ("musllinux_1_2_x86_64", "musllinux_1_1_x86_64", True),
+            ("musllinux_2_0_x86_64", "musllinux_1_2_x86_64", False),
+            ("macosx_10_9_x86_64", "macosx_11_0_x86_64", False),
+            ("macosx_11_0_x86_64", "macosx_10_9_x86_64", True),
+            ("macosx_11_0_arm64", "macosx_12_0_arm64", False),
+            ("macosx_12_0_arm64", "macosx_11_0_arm64", True),
+            ("linux_x86_64", "manylinux_2_28_x86_64", False),
+            ("manylinux_2_28_x86_64", "linux_x86_64", True),
+            (
+                "manylinux_2_17_x86_64",
+                "manylinux_2_28_x86_64.manylinux2014_x86_64",
+                True,
+            ),
+        )
+        for dependency in ("vane-ai", "public-sdk"):
+            index = "test.pypi.org" if dependency == "vane-ai" else "pypi.org"
+            for provider_platform, child_platform, succeeds in cases:
+                responses = {
+                    f"https://api.github.com/repos/{slug}": _github_response(
+                        repository
+                    ),
+                    f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                        distribution,
+                        requires_dist=[f"{dependency}==1.0"],
+                        wheel_tags=(f"cp310-none-{provider_platform}",),
+                    ),
+                    f"https://{index}/pypi/{dependency}/1.0/json": _release_response(
+                        dependency,
+                        "1.0",
+                        [],
+                        wheel_tags=(f"cp310-none-{child_platform}",),
+                    ),
+                }
+                arguments = {
+                    "manifest_root": self._single_manifest_root(manifest),
+                    "generated_at": GENERATED_AT,
+                    "client": _FakeMetadataClient(responses),
+                    "public_resolver": _FakePublicDependencyResolver(
+                        ("public-sdk==1.0",) if dependency == "public-sdk" else ()
+                    ),
+                }
+                with self.subTest(
+                    dependency=dependency,
+                    provider=provider_platform,
+                    child=child_platform,
+                ):
+                    if succeeds:
+                        detail = build_details(**arguments)[0]
+                        self.assertIsNotNone(
+                            detail["installation"]["posix_install_script"]
+                        )
+                    else:
+                        with self.assertRaisesRegex(
+                            SiteBuildError,
+                            "has no non-yanked wheel compatible"
+                            if dependency == "vane-ai"
+                            else "where its lock marker applies",
+                        ):
+                            build_details(**arguments)
+
+    def test_universal2_coverage_uses_each_architectures_deployment_floor(self) -> None:
+        name = "vane-extension-test"
+        for platforms, condition, succeeds in (
+            (("macosx_10_9_x86_64", "macosx_11_0_arm64"), "", True),
+            (("macosx_11_0_x86_64", "macosx_11_0_arm64"), "", False),
+            (("macosx_10_9_x86_64", "macosx_12_0_arm64"), "", False),
+            (("macosx_11_0_universal2",), '; platform_machine == "arm64"', True),
+            (("macosx_11_0_universal2",), '; platform_machine == "x86_64"', False),
+        ):
+            arguments = (
+                name,
+                "1.0",
+                {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+                _FakeMetadataClient(
+                    {
+                        f"https://pypi.org/pypi/{name}/1.0/json": _release_response(
+                            name,
+                            "1.0",
+                            [],
+                            wheel_tags=("cp310-none-macosx_10_9_universal2",),
+                        ),
+                        "https://pypi.org/pypi/helper/1.0/json": _release_response(
+                            "helper",
+                            "1.0",
+                            [],
+                            wheel_tags=tuple(
+                                f"cp310-none-{platform}" for platform in platforms
+                            ),
+                        ),
+                    }
+                ),
+                _FakePublicDependencyResolver(
+                    (f"{name}==1.0", f"helper==1.0{condition}")
+                ),
+            )
+            with self.subTest(platforms=platforms, condition=condition):
+                if succeeds:
+                    self.assertIn(f"{name}==1.0", _pypi_install_arguments(*arguments))
+                else:
+                    with self.assertRaisesRegex(
+                        SiteBuildError, "where its lock marker applies"
+                    ):
+                        _pypi_install_arguments(*arguments)
+
+    def test_joint_wheel_coverage_keeps_each_provider_platform_floor(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        for older, newer in (
+            ("manylinux_2_17_x86_64", "manylinux_2_28_x86_64"),
+            ("musllinux_1_1_x86_64", "musllinux_1_2_x86_64"),
+            ("macosx_10_9_x86_64", "macosx_11_0_x86_64"),
+        ):
+            for sibling in ("vane-extension-sibling", "public-sdk"):
+                index = "pypi.org" if sibling == "public-sdk" else "test.pypi.org"
+                for platforms, succeeds in (
+                    ((older,), False),
+                    ((newer,), True),
+                    ((older, newer), False),
+                ):
+                    responses = {
+                        f"https://api.github.com/repos/{slug}": _github_response(
+                            repository
+                        ),
+                        f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                            distribution,
+                            requires_dist=["vane-ai==1.0", f"{sibling}==1.0"],
+                            wheel_tags=tuple(
+                                f"cp313-none-{platform}" for platform in platforms
+                            ),
+                        ),
+                        "https://test.pypi.org/pypi/vane-ai/1.0/json": _release_response(
+                            "vane-ai",
+                            "1.0",
+                            [],
+                            wheel_tags=(
+                                f"cp313-cp313-{older}",
+                                f"cp313-cp313t-{newer}",
+                            ),
+                        ),
+                        f"https://{index}/pypi/{sibling}/1.0/json": _release_response(
+                            sibling,
+                            "1.0",
+                            [],
+                            wheel_tags=(
+                                f"cp313-cp313t-{older}",
+                                f"cp313-cp313-{newer}",
+                            ),
+                        ),
+                    }
+                    arguments = {
+                        "manifest_root": self._single_manifest_root(manifest),
+                        "generated_at": GENERATED_AT,
+                        "client": _FakeMetadataClient(responses),
+                        "public_resolver": _FakePublicDependencyResolver(
+                            ("public-sdk==1.0",) if sibling == "public-sdk" else ()
+                        ),
+                    }
+                    with self.subTest(sibling=sibling, platforms=platforms):
+                        if succeeds:
+                            detail = build_details(**arguments)[0]
+                            self.assertIsNotNone(
+                                detail["installation"]["posix_install_script"]
+                            )
+                        else:
+                            with self.assertRaisesRegex(
+                                SiteBuildError,
+                                "wheel closure has no common environment",
+                            ):
+                                build_details(**arguments)
+
     def test_macos_platform_model_requires_a_generated_tag(self) -> None:
         for platform_tag, machines in (
             ("macosx_10_4_x86_64", {"x86_64"}),
@@ -2343,6 +2528,7 @@ class BuildSiteTests(unittest.TestCase):
             "python": "cp314-cp314-manylinux_2_28_x86_64",
             "generic-python": "py314-none-any",
             "ABI": "cp313-cp313t-manylinux_2_28_x86_64",
+            "debug-only-ABI": "cp313-cp313d-manylinux_2_28_x86_64",
             "platform": "cp313-cp313-win_amd64",
         }
 
@@ -2517,6 +2703,45 @@ class BuildSiteTests(unittest.TestCase):
         self.assertFalse(_abi_tags_overlap("cp27mu", "abi3"))
         self.assertFalse(_abi_tags_overlap("cp37m", "cp37dm"))
 
+    def test_public_debug_wheels_cannot_cover_non_debug_provider_abis(self) -> None:
+        name = "vane-extension-test"
+        for provider_abi, succeeds in (
+            ("cp310", False),
+            ("abi3", False),
+            ("cp310d", True),
+        ):
+            arguments = (
+                name,
+                "1.0",
+                {"wheel_count": 1, "requires_python": ">=3.10,<3.11"},
+                _FakeMetadataClient(
+                    {
+                        f"https://pypi.org/pypi/{name}/1.0/json": _release_response(
+                            name,
+                            "1.0",
+                            [],
+                            requires_python=">=3.10,<3.11",
+                            wheel_tags=(f"cp310-{provider_abi}-manylinux_2_28_x86_64",),
+                        ),
+                        "https://pypi.org/pypi/helper/1.0/json": _release_response(
+                            "helper",
+                            "1.0",
+                            [],
+                            wheel_tags=("cp310-cp310d-manylinux_2_28_x86_64",),
+                        ),
+                    }
+                ),
+                _FakePublicDependencyResolver((f"{name}==1.0", "helper==1.0")),
+            )
+            with self.subTest(provider_abi=provider_abi):
+                if succeeds:
+                    self.assertIn("helper==1.0", _pypi_install_arguments(*arguments))
+                else:
+                    with self.assertRaisesRegex(
+                        SiteBuildError, "where its lock marker applies"
+                    ):
+                        _pypi_install_arguments(*arguments)
+
     def test_public_wheels_share_the_entire_internal_environment(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
         distribution = str(manifest["distribution_name"])
@@ -2554,12 +2779,18 @@ class BuildSiteTests(unittest.TestCase):
                 True,
             ),
             "conditional-public-wrong-platform": (
-                universal_tag, universal_tag, (linux_tag,),
-                'sys_platform == "win32"', False,
+                universal_tag,
+                universal_tag,
+                (linux_tag,),
+                'sys_platform == "win32"',
+                False,
             ),
             "conditional-public-wrong-python": (
-                universal_tag, universal_tag, ("cp314-none-manylinux_2_28_x86_64",),
-                'python_version < "3.12"', False,
+                universal_tag,
+                universal_tag,
+                ("cp314-none-manylinux_2_28_x86_64",),
+                'python_version < "3.12"',
+                False,
             ),
             "compatible-public-wheel": (
                 linux_tag,
