@@ -85,7 +85,9 @@ _VERSIONED_INTERPRETER_TAG_RE = re.compile(
     r"^([a-z][a-z0-9_]*?)([0-9])([0-9]+)$"
 )
 _CPYTHON_ABI_RE = re.compile(r"cp([0-9])([0-9]+)(t?)(d?)(m?)(u?)")
-_PYPY_ABI_RE = re.compile(r"pypy([0-9])([0-9]+)_pp[0-9]+")
+# The registry models PyPy's documented pp73 native ABI. A recognizable
+# interpreter/version prefix must not admit an arbitrary ABI revision.
+_PYPY_ABI_RE = re.compile(r"pypy([0-9])([0-9]+)_pp73")
 # Bounded, canonical policy versions: leading zeroes are not emitted by pip's
 # tag generation. Keep remote metadata from driving unbounded version loops.
 _PLATFORM_VERSION = r"(?:0|[1-9][0-9]?)"
@@ -671,6 +673,8 @@ def _wheel_python_environment(tag: Tag) -> BaseMarker:
     if versioned_match is None:
         return EmptyMarker()
     interpreter, major_text, minor_text = versioned_match.groups()
+    if len(minor_text) > 1 and minor_text.startswith("0"):
+        return EmptyMarker()
     major = int(major_text)
     minor = int(minor_text)
     version = f"{major}.{minor}"
@@ -680,7 +684,7 @@ def _wheel_python_environment(tag: Tag) -> BaseMarker:
             return EmptyMarker()
         abi_major, abi_minor, threaded, _debug, pymalloc, ucs4 = abi_match.groups()
         if (
-            (int(abi_major), int(abi_minor)) != (major, minor)
+            (abi_major, abi_minor) != (major_text, minor_text)
             or (threaded and (major, minor) < (3, 13))
             or (pymalloc and (major, minor) >= (3, 8))
             or (ucs4 and (major, minor) >= (3, 3))
@@ -692,7 +696,7 @@ def _wheel_python_environment(tag: Tag) -> BaseMarker:
         if interpreter != "pp":
             return EmptyMarker()
         abi_match = _PYPY_ABI_RE.fullmatch(tag.abi)
-        if abi_match is None or tuple(map(int, abi_match.groups())) != (major, minor):
+        if abi_match is None or abi_match.groups() != (major_text, minor_text):
             return EmptyMarker()
     if interpreter == "py":
         if tag.abi != "none":

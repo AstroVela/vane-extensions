@@ -1807,6 +1807,13 @@ class BuildSiteTests(unittest.TestCase):
             "cpython-ABI-on-pypy": "pp310-cp310-manylinux_2_28_x86_64",
             "mismatched-pypy-ABI": "pp310-pypy39_pp73-manylinux_2_28_x86_64",
             "unknown-pypy-ABI": "pp310-unknown-manylinux_2_28_x86_64",
+            "unknown-pypy-ABI-revision": "pp310-pypy310_pp999-manylinux_2_28_x86_64",
+            "unsupported-pypy-ABI-revision": "pp310-pypy310_pp74-manylinux_2_28_x86_64",
+            "noncanonical-pypy-ABI-revision": "pp310-pypy310_pp073-manylinux_2_28_x86_64",
+            "noncanonical-python-tag": "cp3010-none-manylinux_2_28_x86_64",
+            "noncanonical-generic-python-tag": "py3010-none-any",
+            "noncanonical-cpython-ABI-version": "cp310-cp3010-manylinux_2_28_x86_64",
+            "noncanonical-pypy-ABI-version": "pp310-pypy3010_pp73-manylinux_2_28_x86_64",
             "cpython-ABI-on-other-interpreter": "ip310-cp310-win_amd64",
             "unknown-Windows-architecture": "py3-none-win_bogus",
             "unknown-manylinux-architecture": "py3-none-manylinux_2_28_bogus",
@@ -2159,6 +2166,10 @@ class BuildSiteTests(unittest.TestCase):
             "pypy-native-ABI": (
                 "py3-none-any",
                 "pp310-pypy310_pp73-manylinux_2_28_x86_64",
+            ),
+            "pypy311-native-ABI": (
+                "py3-none-any",
+                "pp311-pypy311_pp73-manylinux_2_28_x86_64",
             ),
             "pymalloc-stable-ABI": (
                 "cp37-cp37m-manylinux_2_28_x86_64",

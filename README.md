@@ -103,9 +103,9 @@ environment check, with each lock marker preserved. A universal public lock
 alone does not prove compatibility with a provider's platform. Public pins
 remain separate from the TestPyPI installation step. Their dependency metadata
 is resolved by `uv`, not re-parsed by the Vane-owned dependency graph walker.
-Native ABI validation covers
-CPython and PyPy; other interpreter families require ABI-independent (`none`)
-wheels. The free-threaded Stable ABI (`abi3t`) requires runtime 3.15 or later,
+Native ABI validation covers CPython and PyPy's documented `pp73` ABI revision;
+other interpreter families require ABI-independent (`none`) wheels. The
+free-threaded Stable ABI (`abi3t`) requires runtime 3.15 or later,
 following PEP 803's supported builds; experimental backports are not promised.
 Installability checks currently model Linux, macOS, and Windows host families,
 matching the OS families handled by Vane's extension-wheel platform policies.
