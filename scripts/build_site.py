@@ -894,7 +894,7 @@ def _wheel_set_matches_environment(
     )
 
 
-def _wheel_sets_overlap(
+def _dependency_wheels_cover_provider(
     provider_tags: WheelEnvironments,
     dependency_tags: WheelEnvironments,
     *,
@@ -902,27 +902,32 @@ def _wheel_sets_overlap(
     dependency_python_environment: BaseMarker,
     condition: BaseMarker,
 ) -> bool:
-    applicable = False
     for provider_tag, provider_file_environment in provider_tags.items():
-        provider_environment = intersection(
+        remaining = intersection(
             provider_python_environment,
             condition,
             provider_file_environment,
         )
-        if provider_environment.is_empty():
+        if remaining.is_empty():
             continue
-        applicable = True
+        # Subtract coverage as it is found rather than negating a union of
+        # every dependency wheel, which can expand unrelated tag environments.
         for dependency_tag, dependency_file_environment in dependency_tags.items():
             if not _wheel_tags_overlap(provider_tag, dependency_tag):
                 continue
-            shared_environment = intersection(
-                provider_environment,
+            shared = intersection(
+                remaining,
                 dependency_python_environment,
                 dependency_file_environment,
             )
-            if not shared_environment.is_empty():
-                return True
-    return not applicable
+            if shared.is_empty():
+                continue
+            remaining = intersection(remaining, ~shared)
+            if remaining.is_empty():
+                break
+        if not remaining.is_empty():
+            return False
+    return True
 
 
 def _validate_wheel_closure(
@@ -933,7 +938,24 @@ def _validate_wheel_closure(
     *,
     environment: BaseMarker,
 ) -> None:
-    """Find one environment that can install all simultaneously active releases."""
+    """Cover the provider environments with jointly installable wheel selections."""
+    root_keys = [
+        key
+        for key in selected_conditions
+        if key[0] == canonicalize_name(distribution_name)
+    ]
+    if len(root_keys) != 1:
+        _fail(
+            f"wheel closure must contain one provider release for {distribution_name}"
+        )
+    root_key = root_keys[0]
+    remaining = intersection(
+        environment,
+        release_python_environments[root_key],
+        MarkerUnion.of(*release_wheel_tags[root_key].values()),
+    )
+    if remaining.is_empty():
+        _fail(f"{distribution_name} wheel closure has no common environment")
     releases = sorted(
         selected_conditions,
         key=lambda key: (
@@ -946,9 +968,7 @@ def _validate_wheel_closure(
         key: tuple(
             (
                 tag,
-                intersection(
-                    release_python_environments[key], file_environment
-                ),
+                intersection(release_python_environments[key], file_environment),
             )
             for tag, file_environment in sorted(
                 release_wheel_tags[key].items(), key=lambda item: str(item[0])
@@ -960,24 +980,26 @@ def _validate_wheel_closure(
 
     def search(
         offset: int, environment: BaseMarker, selected_tags: tuple[Tag, ...]
-    ) -> bool:
+    ) -> BaseMarker:
         nonlocal remaining_steps
         remaining_steps -= 1
         if remaining_steps < 0:
             _fail(f"wheel compatibility search is too complex for {distribution_name}")
         if environment.is_empty():
-            return False
+            return EmptyMarker()
         if offset == len(releases):
-            return True
+            return environment
         key = releases[offset]
         condition = selected_conditions[key]
         if not condition.is_any():
             inactive = intersection(environment, ~condition)
-            if not inactive.is_empty() and search(offset + 1, inactive, selected_tags):
-                return True
+            if not inactive.is_empty():
+                solution = search(offset + 1, inactive, selected_tags)
+                if not solution.is_empty():
+                    return solution
         active = intersection(environment, condition)
         if active.is_empty():
-            return False
+            return EmptyMarker()
         for tag, wheel_environment in candidates[key]:
             remaining_steps -= 1
             if remaining_steps < 0:
@@ -989,14 +1011,23 @@ def _validate_wheel_closure(
             ):
                 continue
             shared = intersection(active, wheel_environment)
-            if not shared.is_empty() and search(
-                offset + 1, shared, (*selected_tags, tag)
-            ):
-                return True
-        return False
+            if not shared.is_empty():
+                solution = search(offset + 1, shared, (*selected_tags, tag))
+                if not solution.is_empty():
+                    return solution
+        return EmptyMarker()
 
-    if not search(0, environment, ()):
-        _fail(f"{distribution_name} wheel closure has no common environment")
+    # One solution can cover a whole symbolic region. Remove that region and
+    # repeat until every provider environment is covered, using one shared
+    # budget so a large or conflicting graph still fails with bounded work.
+    while not remaining.is_empty():
+        solution = search(0, remaining, ())
+        if solution.is_empty():
+            _fail(
+                f"{distribution_name} wheel closure has no common environment "
+                "for some supported provider environments"
+            )
+        remaining = intersection(remaining, ~solution)
 
 
 def _conditioned_requirement(
@@ -1492,10 +1523,9 @@ def _validate_public_wheel_closure(
     for key, condition in public_conditions:
         if key == root_key:
             continue
-        # An existential whole-closure search can choose an inactive branch.
-        # Validate every lock condition before allowing that shortcut, keeping
-        # separate conditions even when pins for the same release are merged.
-        if not _wheel_sets_overlap(
+        # Check each provider tag as well as every original lock condition;
+        # merging tags or conditions must not hide missing dependency coverage.
+        if not _dependency_wheels_cover_provider(
             wheel_tags[root_key],
             wheel_tags[key],
             provider_python_environment=provider_python_environment,
@@ -1504,7 +1534,8 @@ def _validate_public_wheel_closure(
         ):
             _fail(
                 f"{distribution_name} wheel closure has no common environment "
-                f"for {key[0]}=={key[1]} where its lock marker applies"
+                f"for {key[0]}=={key[1]} in some provider environments "
+                "where its lock marker applies"
             )
 
     _validate_wheel_closure(
@@ -1682,7 +1713,7 @@ def _testpypi_install_arguments(
                 f"{dependency_name}=={selected_key[1]} Requires-Python is "
                 f"incompatible with {distribution_name}"
             )
-        if not _wheel_sets_overlap(
+        if not _dependency_wheels_cover_provider(
             provider_wheel_tags,
             release_wheel_tags[selected_key],
             provider_python_environment=python_environment,
@@ -1691,7 +1722,8 @@ def _testpypi_install_arguments(
         ):
             _fail(
                 f"{dependency_name}=={selected_key[1]} has no non-yanked wheel "
-                f"compatible with {distribution_name}"
+                f"compatible with {distribution_name} in some applicable "
+                "provider environments"
             )
         for other_key, other_condition in selected_conditions.items():
             if (

@@ -77,9 +77,9 @@ Root requirement markers also carry the complete Python range, including upper
 bounds and excluded versions, instead of relying on temporary project metadata
 that `uv pip compile` does not apply to its universal resolution.
 The site build fails closed if the provider or any selected Vane-owned
-dependency lacks a non-yanked wheel, if an applicable internal release shares no
-Python, ABI, and platform environment with a provider wheel, or if the public
-closure contains a Vane-owned package. The registry never emits
+dependency lacks a non-yanked wheel, if an applicable internal release does not
+cover every provider-wheel Python/platform environment with compatible ABI
+tags, or if the public closure contains a Vane-owned package. The registry never emits
 `--extra-index-url`, because pip gives no priority to the primary index and that
 pattern is vulnerable to dependency confusion. PEP 508 requirements and wheel
 filenames are parsed by `packaging`; `dep-logic` reduces compound extra markers
@@ -91,18 +91,22 @@ range. Requirements that cannot apply to any provider wheel are skipped before
 fetching or validating their releases. Every selected internal release must
 also support the provider environments where its incoming condition is active;
 an incompatible `Requires-Python` closure fails
-the build. A bounded search also requires a common environment for the entire
-internal wheel closure, including the effective conditions of each release;
-pairwise overlap alone is insufficient. Each wheel file's `Requires-Python`
-is intersected with its tag environment, in
+the build. A bounded search also requires a jointly installable selection of
+the entire internal wheel closure in every modeled provider environment,
+including the effective conditions of each release. Finding one working
+environment, or checking dependencies only in isolation, is insufficient.
+The search subtracts each covered region and continues with one shared work
+budget until no unsupported provider environment remains. Each wheel file's
+`Requires-Python` is intersected with its tag environment, in
 addition to the release-level constraint. Files sharing a tag remain alternative
 environments, including disjoint Python ranges; they are not collapsed into one
 broader range. After public resolution, the exact PyPI
 release wheel metadata is fetched concurrently and added to the same common-
-environment check, with each lock marker preserved. Before that aggregate search,
-each public pin is checked against provider wheels where its lock marker applies,
-using the same conditional-overlap validation as internal dependencies. A universal
-public lock alone does not prove compatibility with a provider's platform. Public pins
+environment coverage check, with each lock marker preserved. Before that
+aggregate search, each public pin is checked against provider wheels where its
+lock marker applies, using the same complete conditional-coverage validation as
+internal dependencies. A universal public lock alone does not prove compatibility
+with a provider's platform. Public pins
 remain separate from the TestPyPI installation step. Their dependency metadata
 is resolved by `uv`, not re-parsed by the Vane-owned dependency graph walker.
 Native ABI validation covers CPython and PyPy's documented `pp73` ABI revision;
