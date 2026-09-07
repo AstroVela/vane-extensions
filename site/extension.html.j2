@@ -61,6 +61,12 @@
         <dt>Documentation</dt><dd><a href="{{ documentation.url }}">Provider documentation</a></dd>
       </dl>
       <h2>Install</h2>
+      <p>Use a fresh virtual environment. The wheel tags above are upstream
+        publication metadata, not proof of compatibility on every platform.
+        Deployment checks run wheel-only installation, pip check, and loading
+        on Ubuntu 24.04 x86-64 with CPython 3.10–3.14.
+        <a href="https://github.com/AstroVela/vane-extensions/actions/workflows/pages.yml">Deployment runs</a>
+        record the exact versions tested. Other environments are not verified.</p>
       {% if installation.posix_install_script %}
       <h3>POSIX shell</h3>
       <pre><code>{{ installation.posix_install_script }}</code></pre>

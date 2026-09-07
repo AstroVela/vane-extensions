@@ -100,9 +100,7 @@ def _manifest_string(value: object, field: str, *, max_length: int) -> str:
     return value
 
 
-def _manifest_multiline_string(
-    value: object, field: str, *, max_length: int
-) -> str:
+def _manifest_multiline_string(value: object, field: str, *, max_length: int) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         _fail(f"{field} must be a non-empty trimmed string")
     if len(value) > max_length:
@@ -175,6 +173,8 @@ def _load_manifest(path: Path, directory_name: str) -> dict[str, object]:
     )
     if not EXTENSION_NAME_RE.fullmatch(extension_name):
         _fail("extension_name must use lowercase ASCII extension-name syntax")
+    if extension_name == "index":
+        _fail("extension_name 'index' is reserved for the aggregate document")
     if extension_name != directory_name:
         _fail(
             f"extension_name {extension_name!r} must match directory {directory_name!r}"
@@ -220,7 +220,9 @@ def _load_manifest(path: Path, directory_name: str) -> dict[str, object]:
         not isinstance(documentation_value, dict)
         or set(documentation_value) != DOCUMENTATION_KEYS
     ):
-        _fail("documentation must contain exactly url, hello_world, and extended_description")
+        _fail(
+            "documentation must contain exactly url, hello_world, and extended_description"
+        )
 
     return {
         "extension_name": extension_name,

@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from jsonschema import Draft202012Validator
+
 from scripts.build_catalog import (
     CATALOG_MAX_BYTES,
     PROJECT_ROOT,
@@ -121,6 +123,19 @@ class BuildCatalogTests(unittest.TestCase):
 
             with self.assertRaisesRegex(CatalogBuildError, "distribution_name must be"):
                 build_catalog(root)
+
+    def test_index_name_is_reserved_by_both_validator_and_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            path = self._manifest(root, "index")
+            with self.assertRaisesRegex(CatalogBuildError, "reserved"):
+                build_catalog(root)
+            schema = json.loads(
+                (PROJECT_ROOT / "schema/extension.schema.json").read_text()
+            )
+            self.assertFalse(
+                Draft202012Validator(schema).is_valid(json.loads(path.read_text()))
+            )
 
     def test_repository_must_not_include_a_port(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

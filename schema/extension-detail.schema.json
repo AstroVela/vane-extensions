@@ -34,6 +34,7 @@
     },
     "extension_name": {
       "type": "string",
+      "not": {"const": "index"},
       "pattern": "^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$",
       "maxLength": 128
     },

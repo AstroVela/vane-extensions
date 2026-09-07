@@ -7,45 +7,24 @@ import json
 import logging
 import os
 import re
-import secrets
 import shlex
 import shutil
-import subprocess
 import sys
-import tempfile
 from collections.abc import Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
-from copy import copy
-from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from functools import lru_cache
 from pathlib import Path
-from threading import Lock
 from typing import NoReturn, Protocol
 from urllib.parse import quote, urlsplit
 
 import httpx
-import tomli_w
-from dep_logic.markers import (
-    AnyMarker,
-    BaseMarker,
-    EmptyMarker,
-    MarkerUnion,
-    MultiMarker,
-    from_pkg_marker,
-)
-from dep_logic.markers.utils import intersection
-from dep_logic.specifiers import RangeSpecifier, UnionSpecifier, from_specifierset
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
-from packaging.markers import Marker
 from packaging.requirements import InvalidRequirement, Requirement
 from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.tags import (
     InvalidTag,
     Tag,
     TooManyTagsError,
-    cpython_tags,
-    mac_platforms,
     parse_tag,
 )
 from packaging.utils import (
@@ -61,21 +40,15 @@ from scripts.build_catalog import (
     catalog_bytes,
     load_manifests,
 )
+from scripts.installation import (
+    INDEX_URLS,
+    InstallationResolver,
+    ResolutionError,
+    PdmInstallationResolver,
+)
 
 DETAIL_FORMAT_VERSION = 1
 _LOGGER = logging.getLogger(__name__)
-# A tag may occur in several files. Its value is the union of those files'
-# tag/Python environments, not the release-wide Requires-Python alone.
-WheelEnvironments = Mapping[Tag, BaseMarker]
-
-
-@dataclass(frozen=True)
-class _PlatformPolicy:
-    family: str
-    architectures: frozenset[str]
-    minimum_version: tuple[int, int] | None = None
-
-
 DETAIL_MAX_JSON_BYTES = 1024 * 1024
 AGGREGATE_MAX_JSON_BYTES = 8 * 1024 * 1024
 REMOTE_METADATA_MAX_BYTES = 8 * 1024 * 1024
@@ -83,63 +56,19 @@ REMOTE_METADATA_TIMEOUT_SECONDS = 15.0
 METADATA_MAX_WORKERS = 16
 PACKAGE_REQUIREMENTS_MAX_COUNT = 256
 PACKAGE_WHEEL_TAGS_MAX_COUNT = 512
-WHEEL_CLOSURE_MAX_STEPS = 100_000
-VANE_REQUIREMENTS_MAX_COUNT = 64
-PUBLIC_LOCK_MAX_BYTES = 64 * 1024
-PUBLIC_LOCK_MAX_COUNT = 512
-PUBLIC_LOCK_TIMEOUT_SECONDS = 120.0
 INSTALL_SCRIPT_MAX_LENGTH = 16 * 1024
 _PYTHON_TAG_RE = re.compile(r"^(cp|pp|py)([0-9])([0-9]+)$")
-_BROAD_PYTHON_TAG_RE = re.compile(r"^py([0-9])$")
-_VERSIONED_INTERPRETER_TAG_RE = re.compile(
-    r"^([a-z][a-z0-9_]*?)([0-9])([0-9]+)$"
-)
-_CPYTHON_ABI_RE = re.compile(r"cp([0-9])([0-9]+)(t?)(d?)(m?)(u?)")
-# The registry models PyPy's documented pp73 native ABI. A recognizable
-# interpreter/version prefix must not admit an arbitrary ABI revision.
-_PYPY_ABI_RE = re.compile(r"pypy([0-9])([0-9]+)_pp73")
-# Bounded, canonical policy versions: leading zeroes are not emitted by pip's
-# tag generation. Keep remote metadata from driving unbounded version loops.
-_PLATFORM_VERSION = r"(?:0|[1-9][0-9]?)"
-_LINUX_PLATFORM_RE = re.compile(
-    rf"^(manylinux(?:_{_PLATFORM_VERSION}_{_PLATFORM_VERSION}|1|2010|2014)|"
-    rf"musllinux_{_PLATFORM_VERSION}_{_PLATFORM_VERSION}|linux)_(.+)$"
-)
-_MACOS_PLATFORM_RE = re.compile(
-    rf"^macosx_({_PLATFORM_VERSION})_({_PLATFORM_VERSION})_(.+)$"
-)
-# packaging 26.3's _manylinux._have_compatible_abi targets. Its Linux tag
-# generator inspects the running ELF/libc, so it cannot validate remote wheels
-# through a public cross-platform API as mac_platforms() does for macOS.
-_MANYLINUX_ARCHITECTURES = frozenset(
-    (
-        "x86_64",
-        "i686",
-        "aarch64",
-        "armv7l",
-        "ppc64",
-        "ppc64le",
-        "s390x",
-        "loongarch64",
-        "riscv64",
-    )
-)
-_LINUX_ARCHITECTURES = _MANYLINUX_ARCHITECTURES | {"i386", "armv6l"}
 _UTC_TIMESTAMP_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$"
 )
 _PACKAGE_INDEXES = {
     "pypi": {
         "api": "https://pypi.org/pypi/{distribution}/json",
-        "release_api": "https://pypi.org/pypi/{distribution}/{version}/json",
         "project": "https://pypi.org/project/{distribution}/",
-        "simple": "https://pypi.org/simple/",
     },
     "testpypi": {
         "api": "https://test.pypi.org/pypi/{distribution}/json",
-        "release_api": "https://test.pypi.org/pypi/{distribution}/{version}/json",
         "project": "https://test.pypi.org/project/{distribution}/",
-        "simple": "https://test.pypi.org/simple/",
     },
 }
 _PIP_COMMAND = (
@@ -174,19 +103,6 @@ class JsonMetadataClient(Protocol):
         headers: Mapping[str, str] | None = None,
         allow_not_found: bool = False,
     ) -> object | None: ...
-
-
-class PublicDependencyResolver(Protocol):
-    """Resolve an exact wheel closure from the public PyPI index."""
-
-    def resolve(
-        self,
-        requirements: tuple[str, ...],
-        *,
-        requires_python: str,
-        distribution_name: str,
-        reject_vane: bool,
-    ) -> tuple[str, ...]: ...
 
 
 class MetadataClient:
@@ -242,7 +158,9 @@ class MetadataClient:
         except (httpx.HTTPError, OSError) as exception:
             raise SiteBuildError(f"could not fetch metadata from {url}") from exception
         try:
-            return json.loads(contents.decode("utf-8"), object_pairs_hook=_unique_object)
+            return json.loads(
+                contents.decode("utf-8"), object_pairs_hook=_unique_object
+            )
         except SiteBuildError:
             raise
         except (UnicodeError, ValueError, RecursionError) as exception:
@@ -369,7 +287,7 @@ def _package_file_metadata(
     distribution_name: str,
     version_text: str,
     version: Version,
-) -> tuple[dict[str, object], WheelEnvironments]:
+) -> dict[str, object]:
     raw_files = document.get("urls")
     if not isinstance(raw_files, list):
         _fail(f"package urls must be a list for {distribution_name}")
@@ -378,13 +296,11 @@ def _package_file_metadata(
     python_tags: set[str] = set()
     abi_tags: set[str] = set()
     platform_tags: set[str] = set()
-    available_wheel_tags: dict[Tag, BaseMarker] = {}
+    available_wheel_tags: set[Tag] = set()
     upload_times: list[tuple[datetime, str]] = []
     for raw_file in raw_files:
         package_file = _mapping(raw_file, f"package file for {distribution_name}")
-        package_type = _string(
-            package_file.get("packagetype"), "package packagetype"
-        )
+        package_type = _string(package_file.get("packagetype"), "package packagetype")
         yanked = package_file.get("yanked", False)
         if type(yanked) is not bool:
             _fail(f"package yanked flag is invalid for {distribution_name}")
@@ -424,16 +340,11 @@ def _package_file_metadata(
         ):
             _fail(f"wheel identity does not match {distribution_name}=={version_text}")
         wheel_count += 1
-        if len(available_wheel_tags.keys() | parsed_tags) > PACKAGE_WHEEL_TAGS_MAX_COUNT:
+        available_wheel_tags.update(parsed_tags)
+        if len(available_wheel_tags) > PACKAGE_WHEEL_TAGS_MAX_COUNT:
             _fail(f"package has too many wheel tags for {distribution_name}")
-        file_python_environment = _python_environment_marker(
-            package_file.get("requires_python"), distribution_name, allow_empty=True
-        )
+        # Tags describe published files, not a proof of runtime compatibility.
         for tag in parsed_tags:
-            available_wheel_tags[tag] = MarkerUnion.of(
-                available_wheel_tags.get(tag, EmptyMarker()),
-                intersection(file_python_environment, _wheel_tag_environment(tag)),
-            )
             python_tags.add(tag.interpreter)
             abi_tags.add(tag.abi)
             platform_tags.add(tag.platform)
@@ -444,55 +355,47 @@ def _package_file_metadata(
     latest_release_uploaded_at = (
         max(upload_times, key=lambda item: item[0])[1] if upload_times else None
     )
-    return (
-        {
-            "wheel_count": wheel_count,
-            "python_versions": sorted(python_versions, key=Version),
-            "python_tags": sorted(python_tags),
-            "abi_tags": sorted(abi_tags),
-            "platform_tags": sorted(platform_tags),
-            "latest_release_uploaded_at": latest_release_uploaded_at,
-        },
-        available_wheel_tags,
-    )
+    return {
+        "wheel_count": wheel_count,
+        "python_versions": sorted(python_versions, key=Version),
+        "python_tags": sorted(python_tags),
+        "abi_tags": sorted(abi_tags),
+        "platform_tags": sorted(platform_tags),
+        "latest_release_uploaded_at": latest_release_uploaded_at,
+    }
 
 
 def _package_metadata(
     distribution_name: str, package_index: str, client: JsonMetadataClient
-) -> tuple[dict[str, object], tuple[Requirement, ...], WheelEnvironments]:
+) -> dict[str, object]:
     index = _PACKAGE_INDEXES[package_index]
     escaped_distribution = quote(distribution_name, safe="-")
     api_url = index["api"].format(distribution=escaped_distribution)
     project_url = index["project"].format(distribution=escaped_distribution)
     value = client.get_json(api_url, allow_not_found=True)
     if value is None:
-        return (
-            {
-                "index": package_index,
-                "project_url": project_url,
-                "published": False,
-                "latest_version": None,
-                "requires_python": None,
-                "requires_dist": [],
-                "wheel_count": 0,
-                "python_versions": [],
-                "python_tags": [],
-                "abi_tags": [],
-                "platform_tags": [],
-                "latest_release_uploaded_at": None,
-            },
-            (),
-            {},
-        )
+        return {
+            "index": package_index,
+            "project_url": project_url,
+            "published": False,
+            "latest_version": None,
+            "requires_python": None,
+            "requires_dist": [],
+            "wheel_count": 0,
+            "python_versions": [],
+            "python_tags": [],
+            "abi_tags": [],
+            "platform_tags": [],
+            "latest_release_uploaded_at": None,
+        }
 
     document = _mapping(value, f"package metadata for {distribution_name}")
     info = _mapping(document.get("info"), f"package info for {distribution_name}")
     reported_name = _string(info.get("name"), "package info.name")
     version_text = _string(info.get("version"), "package info.version")
-    if (
-        not isinstance(reported_name, str)
-        or canonicalize_name(reported_name) != canonicalize_name(distribution_name)
-    ):
+    if not isinstance(reported_name, str) or canonicalize_name(
+        reported_name
+    ) != canonicalize_name(distribution_name):
         _fail(f"package metadata identity does not match {distribution_name}")
     if not isinstance(version_text, str):
         _fail(f"package version is missing for {distribution_name}")
@@ -514,26 +417,20 @@ def _package_metadata(
                 f"package Requires-Python is invalid for {distribution_name}"
             ) from exception
     requirements = _package_requirements(info, distribution_name)
-    file_metadata, wheel_tags = _package_file_metadata(
+    file_metadata = _package_file_metadata(
         document, distribution_name, version_text, latest_version
     )
-    return (
-        {
-            "index": package_index,
-            "project_url": project_url,
-            "published": True,
-            "latest_version": version_text,
-            "requires_python": requires_python,
-            "requires_dist": [
-                str(requirement)
-                for requirement in requirements
-                if requirement.url is None
-            ],
-            **file_metadata,
-        },
-        requirements,
-        wheel_tags,
-    )
+    return {
+        "index": package_index,
+        "project_url": project_url,
+        "published": True,
+        "latest_version": version_text,
+        "requires_python": requires_python,
+        "requires_dist": [
+            str(requirement) for requirement in requirements if requirement.url is None
+        ],
+        **file_metadata,
+    }
 
 
 def _download_metadata(
@@ -563,1093 +460,6 @@ def _download_metadata(
         )
         return unavailable
     return {"downloads_last_week": downloads, "source": "pypistats.org"}
-
-
-def _is_vane_distribution(distribution_name: str) -> bool:
-    normalized = canonicalize_name(distribution_name)
-    return normalized == "vane-ai" or normalized.startswith("vane-extension-")
-
-
-def _marker_for_base_install(marker: BaseMarker) -> BaseMarker:
-    """Substitute an empty selected extra while preserving other conditions."""
-    if marker.is_any() or marker.is_empty():
-        return marker
-    if isinstance(marker, MultiMarker):
-        return MultiMarker.of(*(_marker_for_base_install(item) for item in marker))
-    if isinstance(marker, MarkerUnion):
-        return MarkerUnion.of(*(_marker_for_base_install(item) for item in marker))
-    if marker.only("extra") != marker:
-        return marker
-    if Marker(str(marker)).evaluate(
-        environment={"extra": ""}, context="metadata"
-    ):
-        return AnyMarker()
-    return EmptyMarker()
-
-
-def _requirement_for_base_install(requirement: Requirement) -> Requirement | None:
-    """Apply the empty-extra context without evaluating platform conditions."""
-    if requirement.marker is None:
-        return requirement
-    try:
-        marker = from_pkg_marker(requirement.marker)
-        base_marker = _marker_for_base_install(marker)
-        if base_marker.is_empty():
-            return None
-        if base_marker.is_any():
-            base_requirement = copy(requirement)
-            base_requirement.marker = None
-            return base_requirement
-        if base_marker == marker:
-            return requirement
-        base_requirement = copy(requirement)
-        base_requirement.marker = Marker(str(base_marker))
-        return base_requirement
-    except (KeyError, TypeError, ValueError) as exception:
-        raise SiteBuildError(
-            "package marker cannot be evaluated for "
-            f"{canonicalize_name(requirement.name)}"
-        ) from exception
-
-
-def _python_environment_marker(
-    requires_python: object, distribution_name: str, *, allow_empty: bool = False
-) -> BaseMarker:
-    if requires_python is None:
-        return AnyMarker()
-    if not isinstance(requires_python, str) or len(requires_python) > 4096:
-        _fail(f"package Requires-Python is invalid for {distribution_name}")
-    try:
-        specifiers = SpecifierSet(requires_python)
-        markers = tuple(
-            from_pkg_marker(
-                Marker(
-                    f'python_full_version {specifier.operator} '
-                    f'"{specifier.version}"'
-                )
-            )
-            for specifier in specifiers
-        )
-        environment = MultiMarker.of(*markers) if markers else AnyMarker()
-    except (KeyError, TypeError, ValueError) as exception:
-        raise SiteBuildError(
-            f"package Requires-Python is invalid for {distribution_name}"
-        ) from exception
-    if environment.is_empty() and not allow_empty:
-        _fail(f"package Requires-Python is empty for {distribution_name}")
-    return environment
-
-
-def _equals_marker(name: str, value: str) -> BaseMarker:
-    return from_pkg_marker(Marker(f"{name} == {json.dumps(value)}"))
-
-
-def _one_of_marker(name: str, values: frozenset[str]) -> BaseMarker:
-    return MarkerUnion.of(*(_equals_marker(name, value) for value in values))
-
-
-def _implementation_environment(interpreter: str) -> BaseMarker:
-    implementations = {
-        "cp": ("cpython", "CPython"),
-        "graalpy": ("graalpy", "GraalPy"),
-        "ip": ("ironpython", "IronPython"),
-        "jy": ("jython", "Jython"),
-        "pp": ("pypy", "PyPy"),
-    }
-    names = implementations.get(interpreter)
-    if names is None:
-        return _equals_marker("implementation_name", interpreter)
-    implementation_name, display_name = names
-    return MultiMarker.of(
-        _equals_marker("implementation_name", implementation_name),
-        _equals_marker("platform_python_implementation", display_name),
-    )
-
-
-def _wheel_python_environment(tag: Tag) -> BaseMarker:
-    if tag.platform == "any" and tag.abi != "none":
-        return EmptyMarker()
-    broad_match = _BROAD_PYTHON_TAG_RE.fullmatch(tag.interpreter)
-    if broad_match is not None:
-        if tag.abi != "none":
-            return EmptyMarker()
-        major = int(broad_match.group(1))
-        return MultiMarker.of(
-            from_pkg_marker(Marker(f'python_version >= "{major}"')),
-            from_pkg_marker(Marker(f'python_version < "{major + 1}"')),
-        )
-
-    versioned_match = _VERSIONED_INTERPRETER_TAG_RE.fullmatch(tag.interpreter)
-    if versioned_match is None:
-        return EmptyMarker()
-    interpreter, major_text, minor_text = versioned_match.groups()
-    if len(minor_text) > 1 and minor_text.startswith("0"):
-        return EmptyMarker()
-    major = int(major_text)
-    minor = int(minor_text)
-    version = f"{major}.{minor}"
-    if interpreter == "cp" and tag.abi not in {"none", "abi3", "abi3t"}:
-        abi_match = _CPYTHON_ABI_RE.fullmatch(tag.abi)
-        if abi_match is None:
-            return EmptyMarker()
-        abi_major, abi_minor, threaded, _debug, pymalloc, ucs4 = abi_match.groups()
-        if (
-            (abi_major, abi_minor) != (major_text, minor_text)
-            or (threaded and (major, minor) < (3, 13))
-            or (pymalloc and (major, minor) >= (3, 8))
-            or (ucs4 and (major, minor) >= (3, 3))
-        ):
-            return EmptyMarker()
-    elif interpreter != "cp" and tag.abi != "none":
-        # Only admit native ABIs whose interpreter identity we can validate.
-        # Matching two arbitrary ABI strings does not make either installable.
-        if interpreter != "pp":
-            return EmptyMarker()
-        abi_match = _PYPY_ABI_RE.fullmatch(tag.abi)
-        if abi_match is None or abi_match.groups() != (major_text, minor_text):
-            return EmptyMarker()
-    if interpreter == "py":
-        if tag.abi != "none":
-            return EmptyMarker()
-        implementation_environment: BaseMarker = AnyMarker()
-    else:
-        implementation_environment = _implementation_environment(interpreter)
-
-    if tag.abi in {"abi3", "abi3t"} and (
-        interpreter != "cp" or (major, minor) < (3, 2)
-    ):
-        return EmptyMarker()
-    if tag.abi == "abi3t":
-        # PEP 803 starts supported abi3t builds at 3.15. packaging deliberately
-        # accepts older cpXY targets for experimental backports, which the
-        # registry does not promise. Preserve any higher target's own floor.
-        runtime_major, runtime_minor = max((major, minor), (3, 15))
-        version = f"{runtime_major}.{runtime_minor}"
-    if interpreter == "py" or tag.abi in {"abi3", "abi3t"}:
-        version_environment = MultiMarker.of(
-            from_pkg_marker(Marker(f'python_version >= "{version}"')),
-            from_pkg_marker(Marker(f'python_version < "{major + 1}"')),
-        )
-    else:
-        version_environment = from_pkg_marker(
-            Marker(f'python_version == "{version}"')
-        )
-    return MultiMarker.of(implementation_environment, version_environment)
-
-
-def _operating_system_environment(system: str) -> BaseMarker:
-    values = {
-        "linux": ("posix", "linux", "Linux"),
-        "macos": ("posix", "darwin", "Darwin"),
-        "windows": ("nt", "win32", "Windows"),
-    }
-    os_name, sys_platform, platform_system = values[system]
-    return MultiMarker.of(
-        _equals_marker("os_name", os_name),
-        _equals_marker("sys_platform", sys_platform),
-        _equals_marker("platform_system", platform_system),
-    )
-
-
-@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT)
-def _macos_architectures(platform_tag: str) -> frozenset[str]:
-    match = _MACOS_PLATFORM_RE.fullmatch(platform_tag)
-    if match is None:
-        return frozenset()
-    major, minor, _wheel_architecture = match.groups()
-    major_version = int(major)
-    minor_version = int(minor)
-    target_version = (
-        max(major_version, 11),
-        0 if major_version >= 11 else minor_version,
-    )
-    return frozenset(
-        architecture
-        for architecture in ("arm64", "x86_64")
-        if platform_tag in set(mac_platforms(target_version, architecture))
-    )
-
-
-def _linux_platform_policy(policy: str, architecture: str) -> _PlatformPolicy | None:
-    if architecture not in _LINUX_ARCHITECTURES:
-        return None
-    architectures = frozenset((architecture,))
-    if policy == "linux":
-        return _PlatformPolicy("linux-any", architectures)
-    if policy.startswith("musllinux_"):
-        _, major, minor = policy.split("_")
-        version = (int(major), int(minor))
-        # packaging emits musllinux tags only for the running musl major.
-        return (
-            _PlatformPolicy(f"linux-musl-{version[0]}", architectures, version)
-            if version[0] >= 1
-            else None
-        )
-    if architecture not in _MANYLINUX_ARCHITECTURES:
-        return None
-    if policy in {"manylinux1", "manylinux2010"}:
-        if architecture not in {"x86_64", "i686"}:
-            return None
-        return _PlatformPolicy(
-            "linux-glibc",
-            architectures,
-            (2, 5) if policy == "manylinux1" else (2, 12),
-        )
-    if policy == "manylinux2014":
-        return (
-            _PlatformPolicy("linux-glibc", architectures, (2, 17))
-            if architecture not in {"loongarch64", "riscv64"}
-            else None
-        )
-    _manylinux, major, minor = policy.split("_")
-    minimum_minor = 5 if architecture in {"x86_64", "i686"} else 17
-    if (int(major), int(minor)) < (2, minimum_minor):
-        return None
-    return _PlatformPolicy("linux-glibc", architectures, (int(major), int(minor)))
-
-
-@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT)
-def _platform_shape(platform_tag: str) -> _PlatformPolicy:
-    if platform_tag == "any":
-        return _PlatformPolicy("any", frozenset())
-    linux_match = _LINUX_PLATFORM_RE.fullmatch(platform_tag)
-    if linux_match is not None:
-        policy, architecture = linux_match.groups()
-        support = _linux_platform_policy(policy, architecture)
-        if support is not None:
-            return support
-    if platform_tag == "win32":
-        return _PlatformPolicy("windows", frozenset(("x86",)))
-    if platform_tag.startswith("win_"):
-        architecture = platform_tag.removeprefix("win_")
-        machine = {"amd64": "AMD64", "arm64": "ARM64"}.get(architecture)
-        if machine is not None:
-            return _PlatformPolicy("windows", frozenset((machine,)))
-    macos_architectures = _macos_architectures(platform_tag)
-    if macos_architectures:
-        _, major, minor, _architecture = platform_tag.split("_", 3)
-        return _PlatformPolicy("macos", macos_architectures, (int(major), int(minor)))
-    return _PlatformPolicy(f"exact:{platform_tag}", frozenset())
-
-
-def _wheel_platform_environment(platform_tag: str) -> BaseMarker:
-    policy = _platform_shape(platform_tag)
-    family, architectures = policy.family, policy.architectures
-    if family == "any":
-        return AnyMarker()
-    if family.startswith("linux-"):
-        operating_system = _operating_system_environment("linux")
-    elif family == "windows":
-        operating_system = _operating_system_environment("windows")
-    elif family == "macos":
-        operating_system = _operating_system_environment("macos")
-    else:
-        # The registry currently models Vane's Linux/macOS/Windows host
-        # families, not every platform accepted by Python's wheel syntax.
-        # An opaque tag must not stand for an arbitrary OS marker environment.
-        return EmptyMarker()
-    machine_environment = (
-        _one_of_marker("platform_machine", architectures)
-        if architectures
-        else AnyMarker()
-    )
-    return MultiMarker.of(operating_system, machine_environment)
-
-
-def _platform_tags_overlap(left: str, right: str) -> bool:
-    left_policy, right_policy = _platform_shape(left), _platform_shape(right)
-    left_family, left_architectures = left_policy.family, left_policy.architectures
-    right_family, right_architectures = right_policy.family, right_policy.architectures
-    if "any" in {left_family, right_family}:
-        return True
-    if left_family.startswith("linux-") and right_family.startswith("linux-"):
-        libc_compatible = left_family == right_family or "linux-any" in {
-            left_family,
-            right_family,
-        }
-        return libc_compatible and bool(left_architectures & right_architectures)
-    if left_family != right_family:
-        return False
-    if left_family in {"windows", "macos"}:
-        return bool(left_architectures & right_architectures)
-    return left_family == right_family
-
-
-@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT * 4)
-def _platform_coverage_environment(provider: str, dependency: str) -> BaseMarker:
-    """Restrict coverage to architectures installable at the provider's floor."""
-    required = _platform_shape(dependency)
-    if required.family == "any":
-        return AnyMarker()
-    if not _platform_tags_overlap(provider, dependency):
-        return EmptyMarker()
-    if required.minimum_version is None:
-        return _wheel_platform_environment(dependency)
-    supported = _platform_shape(provider)
-    if supported.minimum_version is None:
-        # Neither an any wheel nor generic linux tag promises a minimum libc
-        # or macOS version that could justify a versioned dependency floor.
-        return EmptyMarker()
-    if supported.family == "macos":
-        # universal2 can advertise macOS 10.x on x86-64 while its Arm64 half
-        # starts at 11.0. Let packaging decide membership at each real floor.
-        architectures = frozenset(
-            architecture
-            for architecture in supported.architectures & required.architectures
-            if dependency
-            in mac_platforms(
-                max(supported.minimum_version, (11, 0))
-                if architecture == "arm64"
-                else supported.minimum_version,
-                architecture,
-            )
-        )
-        if not architectures:
-            return EmptyMarker()
-        return intersection(
-            _wheel_platform_environment(dependency),
-            _one_of_marker("platform_machine", architectures),
-        )
-    if (
-        supported.family == required.family
-        and required.minimum_version <= supported.minimum_version
-    ):
-        return _wheel_platform_environment(dependency)
-    return EmptyMarker()
-
-
-@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT)
-def _native_abi_accepts(runtime_abi: str, required_abi: str) -> bool:
-    if required_abi == "none" or runtime_abi == required_abi:
-        return True
-    match = _CPYTHON_ABI_RE.fullmatch(runtime_abi)
-    if match is None:
-        return False
-    major, minor, _threaded, debug, _pymalloc, _ucs4 = match.groups()
-    version = (int(major), int(minor))
-    if version[1] > 99:
-        return False
-    abis = [runtime_abi]
-    if debug and version >= (3, 8):
-        abis.append(runtime_abi.removesuffix("d"))
-    return any(
-        tag.abi == required_abi
-        for tag in cpython_tags(version, abis=abis, platforms=("any",))
-    )
-
-
-@lru_cache(maxsize=PACKAGE_WHEEL_TAGS_MAX_COUNT)
-def _abi_tags_overlap(left: str, right: str) -> bool:
-    if left == "none" or right == "none":
-        return True
-    return _native_abi_accepts(left, right) or _native_abi_accepts(right, left)
-
-
-def _wheel_coverage_environment(provider: Tag, dependency: Tag) -> BaseMarker:
-    if not _abi_tags_overlap(provider.abi, dependency.abi):
-        return EmptyMarker()
-    if _CPYTHON_ABI_RE.fullmatch(provider.abi):
-        if not _native_abi_accepts(provider.abi, dependency.abi):
-            return EmptyMarker()
-    elif provider.abi in {"abi3", "abi3t"}:
-        native_dependency = _CPYTHON_ABI_RE.fullmatch(dependency.abi)
-        if native_dependency is not None and native_dependency.group(4):
-            # Stable ABI support includes non-debug runtimes too; a debug-only
-            # wheel cannot cover them just because both work on debug Python.
-            return EmptyMarker()
-    return _platform_coverage_environment(provider.platform, dependency.platform)
-
-
-def _wheel_tag_environment(tag: Tag) -> BaseMarker:
-    return MultiMarker.of(
-        _wheel_python_environment(tag),
-        _wheel_platform_environment(tag.platform),
-    )
-
-
-def _wheel_tags_overlap(left: Tag, right: Tag) -> bool:
-    return _abi_tags_overlap(left.abi, right.abi) and _platform_tags_overlap(
-        left.platform, right.platform
-    )
-
-
-def _wheel_set_matches_environment(
-    wheel_tags: WheelEnvironments, environment: BaseMarker
-) -> bool:
-    return any(
-        not intersection(environment, wheel_environment).is_empty()
-        for wheel_environment in wheel_tags.values()
-    )
-
-
-def _dependency_wheels_cover_provider(
-    provider_tags: WheelEnvironments,
-    dependency_tags: WheelEnvironments,
-    *,
-    provider_python_environment: BaseMarker,
-    dependency_python_environment: BaseMarker,
-    condition: BaseMarker,
-) -> bool:
-    for provider_tag, provider_file_environment in provider_tags.items():
-        remaining = intersection(
-            provider_python_environment,
-            condition,
-            provider_file_environment,
-        )
-        if remaining.is_empty():
-            continue
-        # Subtract coverage as it is found rather than negating a union of
-        # every dependency wheel, which can expand unrelated tag environments.
-        for dependency_tag, dependency_file_environment in dependency_tags.items():
-            if not _wheel_tags_overlap(provider_tag, dependency_tag):
-                continue
-            shared = intersection(
-                remaining,
-                dependency_python_environment,
-                dependency_file_environment,
-                _wheel_coverage_environment(provider_tag, dependency_tag),
-            )
-            if shared.is_empty():
-                continue
-            remaining = intersection(remaining, ~shared)
-            if remaining.is_empty():
-                break
-        if not remaining.is_empty():
-            return False
-    return True
-
-
-def _validate_wheel_closure(
-    distribution_name: str,
-    selected_conditions: Mapping[tuple[str, str], BaseMarker],
-    release_python_environments: Mapping[tuple[str, str], BaseMarker],
-    release_wheel_tags: Mapping[tuple[str, str], WheelEnvironments],
-    *,
-    environment: BaseMarker,
-) -> None:
-    """Cover the provider environments with jointly installable wheel selections."""
-    root_keys = [
-        key
-        for key in selected_conditions
-        if key[0] == canonicalize_name(distribution_name)
-    ]
-    if len(root_keys) != 1:
-        _fail(
-            f"wheel closure must contain one provider release for {distribution_name}"
-        )
-    root_key = root_keys[0]
-    provider_environments = tuple(
-        (
-            tag,
-            intersection(
-                environment, release_python_environments[root_key], file_environment
-            ),
-        )
-        for tag, file_environment in sorted(
-            release_wheel_tags[root_key].items(), key=lambda item: str(item[0])
-        )
-    )
-    if not any(not supported.is_empty() for _, supported in provider_environments):
-        _fail(f"{distribution_name} wheel closure has no common environment")
-    releases = sorted(
-        selected_conditions.keys() - {root_key},
-        key=lambda key: (
-            not selected_conditions[key].is_any(),
-            len(release_wheel_tags[key]),
-            key,
-        ),
-    )
-    candidates = {
-        key: tuple(
-            (
-                tag,
-                intersection(release_python_environments[key], file_environment),
-            )
-            for tag, file_environment in sorted(
-                release_wheel_tags[key].items(), key=lambda item: str(item[0])
-            )
-        )
-        for key in releases
-    }
-    remaining_steps = WHEEL_CLOSURE_MAX_STEPS
-
-    def search(
-        offset: int,
-        environment: BaseMarker,
-        selected_tags: tuple[Tag, ...],
-        provider_tag: Tag,
-    ) -> BaseMarker:
-        nonlocal remaining_steps
-        remaining_steps -= 1
-        if remaining_steps < 0:
-            _fail(f"wheel compatibility search is too complex for {distribution_name}")
-        if environment.is_empty():
-            return EmptyMarker()
-        if offset == len(releases):
-            return environment
-        key = releases[offset]
-        condition = selected_conditions[key]
-        if not condition.is_any():
-            inactive = intersection(environment, ~condition)
-            if not inactive.is_empty():
-                solution = search(offset + 1, inactive, selected_tags, provider_tag)
-                if not solution.is_empty():
-                    return solution
-        active = intersection(environment, condition)
-        if active.is_empty():
-            return EmptyMarker()
-        for tag, wheel_environment in candidates[key]:
-            remaining_steps -= 1
-            if remaining_steps < 0:
-                _fail(
-                    f"wheel compatibility search is too complex for {distribution_name}"
-                )
-            if not all(
-                _wheel_tags_overlap(tag, selected) for selected in selected_tags
-            ):
-                continue
-            shared = intersection(
-                active,
-                wheel_environment,
-                _wheel_coverage_environment(provider_tag, tag),
-            )
-            if not shared.is_empty():
-                solution = search(
-                    offset + 1, shared, (*selected_tags, tag), provider_tag
-                )
-                if not solution.is_empty():
-                    return solution
-        return EmptyMarker()
-
-    # Keep each provider tag fixed: merging its marker environments would lose
-    # libc/deployment floors and ABI identity. Subtract covered regions under
-    # each tag with one shared budget across the entire validation.
-    for provider_tag, remaining in provider_environments:
-        while not remaining.is_empty():
-            solution = search(0, remaining, (provider_tag,), provider_tag)
-            if solution.is_empty():
-                _fail(
-                    f"{distribution_name} wheel closure has no common environment "
-                    "for some supported provider environments"
-                )
-            remaining = intersection(remaining, ~solution)
-
-
-def _conditioned_requirement(
-    requirement: Requirement,
-    inherited_condition: BaseMarker,
-    environment: BaseMarker,
-    distribution_name: str,
-) -> tuple[Requirement, BaseMarker] | None:
-    base_requirement = _requirement_for_base_install(requirement)
-    if base_requirement is None:
-        return None
-    try:
-        own_condition = (
-            AnyMarker()
-            if base_requirement.marker is None
-            else from_pkg_marker(base_requirement.marker)
-        )
-        condition = MultiMarker.of(inherited_condition, own_condition)
-        if intersection(environment, condition).is_empty():
-            return None
-        conditioned = copy(base_requirement)
-        conditioned.marker = None
-        return conditioned, condition
-    except (KeyError, TypeError, ValueError) as exception:
-        raise SiteBuildError(
-            f"package marker cannot be combined for {distribution_name}"
-        ) from exception
-
-
-def _requirement_with_condition(
-    requirement: Requirement, condition: BaseMarker
-) -> str:
-    conditioned = copy(requirement)
-    conditioned.marker = None if condition.is_any() else Marker(str(condition))
-    return str(conditioned)
-
-
-def _internal_pin_with_condition(
-    distribution_name: str, version: str, condition: BaseMarker
-) -> str:
-    pin = f"{distribution_name}==={version}"
-    return pin if condition.is_any() else f"{pin}; {condition}"
-
-
-def _conditions_overlap(
-    environment: BaseMarker,
-    left: BaseMarker,
-    right: BaseMarker,
-) -> bool:
-    return not intersection(environment, left, right).is_empty()
-
-
-def _parse_public_lock(
-    contents: bytes, *, distribution_name: str, reject_vane: bool
-) -> tuple[str, ...]:
-    if len(contents) > PUBLIC_LOCK_MAX_BYTES:
-        _fail(f"public dependency lock is too large for {distribution_name}")
-    try:
-        lines = contents.decode("utf-8").splitlines()
-    except UnicodeError as exception:
-        raise SiteBuildError(
-            f"public dependency lock is invalid for {distribution_name}"
-        ) from exception
-
-    locked_requirements: set[str] = set()
-    for line in lines:
-        requirement_text = line.strip()
-        if not requirement_text:
-            continue
-        try:
-            requirement = Requirement(requirement_text)
-        except InvalidRequirement as exception:
-            raise SiteBuildError(
-                f"public dependency lock is invalid for {distribution_name}"
-            ) from exception
-        normalized_name = canonicalize_name(requirement.name)
-        specifiers = list(requirement.specifier)
-        if (
-            requirement.url is not None
-            or requirement.extras
-            or len(specifiers) != 1
-            or specifiers[0].operator not in {"==", "==="}
-            or "*" in specifiers[0].version
-        ):
-            _fail(f"public dependency lock is invalid for {distribution_name}")
-        try:
-            locked_version = str(Version(specifiers[0].version))
-        except InvalidVersion as exception:
-            raise SiteBuildError(
-                f"public dependency lock is invalid for {distribution_name}"
-            ) from exception
-        if reject_vane and _is_vane_distribution(normalized_name):
-            _fail(
-                f"public dependency closure for {distribution_name} contains "
-                f"Vane-owned package {normalized_name}"
-            )
-        if _requirement_for_base_install(requirement) is not requirement:
-            _fail(
-                f"public dependency lock contains an unresolved extra marker "
-                f"for {distribution_name}"
-            )
-        locked_requirement = f"{normalized_name}=={locked_version}"
-        if requirement.marker is not None:
-            locked_requirement = f"{locked_requirement}; {requirement.marker}"
-        locked_requirements.add(locked_requirement)
-        if len(locked_requirements) > PUBLIC_LOCK_MAX_COUNT:
-            _fail(f"public dependency lock is too large for {distribution_name}")
-    return tuple(sorted(locked_requirements, key=str.casefold))
-
-
-def _resolver_environment() -> dict[str, str]:
-    return {
-        key: value
-        for key, value in os.environ.items()
-        if not key.upper().startswith(("PIP_", "UV_"))
-    }
-
-
-def _resolver_python_lower_bound(requires_python: str) -> str:
-    """Return a conservative uv lower bound, independent of the build host."""
-    try:
-        specifier = from_specifierset(SpecifierSet(requires_python))
-    except (TypeError, ValueError) as exception:
-        raise SiteBuildError(
-            "invalid Requires-Python for public resolution"
-        ) from exception
-    if isinstance(specifier, UnionSpecifier):
-        specifier = specifier.ranges[0]
-    if not isinstance(specifier, RangeSpecifier) or specifier.min is None:
-        _fail("public resolution requires a finite Python lower bound")
-    lower = specifier.min
-    if lower.epoch or lower.is_prerelease or lower.is_postrelease or lower.local:
-        _fail("public resolution requires a stable Python lower bound")
-    # uv accepts an inclusive major.minor.patch bound. Keep an exclusive endpoint
-    # as a conservative bound; root markers preserve the actual exclusion.
-    # Do not round patch bounds up and omit a supported environment.
-    if len(lower.release) > 3:
-        _fail("public resolution requires a major.minor.patch Python lower bound")
-    return ".".join(map(str, (*lower.release, 0, 0)[:3]))
-
-
-def _resolver_requirements(
-    requirements: tuple[str, ...], requires_python: str
-) -> list[str]:
-    # pip compile does not use project.requires-python. Carry its complete
-    # range on the roots so upper bounds and exclusions constrain the graph.
-    # Keep the original operators: normalizing ~= through a full-version marker
-    # and then serializing it could change the significant release precision.
-    python_condition = " and ".join(
-        f"python_full_version {specifier.operator} {json.dumps(specifier.version)}"
-        for specifier in sorted(SpecifierSet(requires_python), key=str)
-    )
-    result = []
-    for text in requirements:
-        requirement = Requirement(text)
-        requirement.marker = Marker(
-            python_condition
-            if requirement.marker is None
-            else f"({requirement.marker}) and ({python_condition})"
-        )
-        result.append(str(requirement))
-    return result
-
-
-class UvPublicDependencyResolver:
-    """Build one universal, exact public dependency closure with uv."""
-
-    def __init__(self) -> None:
-        self._cache: dict[tuple[str, tuple[str, ...]], bytes] = {}
-        self._inflight: dict[
-            tuple[str, tuple[str, ...]], Future[bytes]
-        ] = {}
-        self._lock = Lock()
-
-    def resolve(
-        self,
-        requirements: tuple[str, ...],
-        *,
-        requires_python: str,
-        distribution_name: str,
-        reject_vane: bool,
-    ) -> tuple[str, ...]:
-        normalized_requirements = tuple(sorted(set(requirements), key=str.casefold))
-        if not normalized_requirements:
-            return ()
-        cache_key = (requires_python, normalized_requirements)
-        with self._lock:
-            cached = self._cache.get(cache_key)
-            if cached is not None:
-                contents = cached
-            else:
-                future = self._inflight.get(cache_key)
-                owns_resolution = future is None
-                if future is None:
-                    future = Future()
-                    self._inflight[cache_key] = future
-        if cached is None:
-            if owns_resolution:
-                try:
-                    contents = self._resolve_uncached(
-                        normalized_requirements,
-                        requires_python=requires_python,
-                    )
-                except BaseException as exception:
-                    future.set_exception(exception)
-                    with self._lock:
-                        self._inflight.pop(cache_key, None)
-                    if isinstance(exception, SiteBuildError):
-                        raise SiteBuildError(
-                            "could not resolve public dependency closure for "
-                            f"{distribution_name}"
-                        ) from exception
-                    raise
-                else:
-                    future.set_result(contents)
-                    with self._lock:
-                        self._cache[cache_key] = contents
-                        self._inflight.pop(cache_key, None)
-            else:
-                try:
-                    contents = future.result()
-                except SiteBuildError as exception:
-                    raise SiteBuildError(
-                        "could not resolve public dependency closure for "
-                        f"{distribution_name}"
-                    ) from exception
-        return _parse_public_lock(
-            contents,
-            distribution_name=distribution_name,
-            reject_vane=reject_vane,
-        )
-
-    def _resolve_uncached(
-        self,
-        requirements: tuple[str, ...],
-        *,
-        requires_python: str,
-    ) -> bytes:
-        python_lower_bound = _resolver_python_lower_bound(requires_python)
-        try:
-            with tempfile.TemporaryDirectory(prefix="vane-public-lock-") as temporary:
-                temporary_root = Path(temporary)
-                project_path = temporary_root / "pyproject.toml"
-                output_path = temporary_root / "requirements.txt"
-                project_path.write_text(
-                    tomli_w.dumps(
-                        {
-                            "project": {
-                                "name": (
-                                    "vane-registry-resolution-"
-                                    f"{secrets.token_hex(16)}"
-                                ),
-                                "version": "0",
-                                "requires-python": requires_python,
-                                "dependencies": _resolver_requirements(
-                                    requirements, requires_python
-                                ),
-                            }
-                        }
-                    ),
-                    encoding="utf-8",
-                )
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "uv",
-                        "--quiet",
-                        "--no-progress",
-                        "--no-cache",
-                        "pip",
-                        "compile",
-                        str(project_path),
-                        "--universal",
-                        "--python-version",
-                        python_lower_bound,
-                        "--no-header",
-                        "--no-annotate",
-                        "--no-strip-markers",
-                        "--default-index",
-                        _PACKAGE_INDEXES["pypi"]["simple"],
-                        "--no-config",
-                        "--no-sources",
-                        "--no-python-downloads",
-                        "--keyring-provider",
-                        "disabled",
-                        "--only-binary=:all:",
-                        "--output-file",
-                        str(output_path),
-                    ],
-                    cwd=temporary_root,
-                    env=_resolver_environment(),
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    timeout=PUBLIC_LOCK_TIMEOUT_SECONDS,
-                    check=False,
-                )
-                if result.returncode != 0:
-                    _fail("could not resolve public dependency closure")
-                with output_path.open("rb") as output_file:
-                    contents = output_file.read(PUBLIC_LOCK_MAX_BYTES + 1)
-        except SiteBuildError:
-            raise
-        except (OSError, subprocess.SubprocessError) as exception:
-            raise SiteBuildError(
-                "could not resolve public dependency closure"
-            ) from exception
-        return contents
-
-
-_PUBLIC_DEPENDENCY_RESOLVER = UvPublicDependencyResolver()
-
-
-def _exact_index_requirement(
-    requirement: Requirement, parent_distribution: str
-) -> tuple[str, str]:
-    normalized_name = canonicalize_name(requirement.name)
-    specifiers = list(requirement.specifier)
-    if (
-        requirement.url is not None
-        or requirement.extras
-        or len(specifiers) != 1
-        or specifiers[0].operator not in {"==", "==="}
-        or "*" in specifiers[0].version
-    ):
-        _fail(
-            f"{parent_distribution} must pin dependency "
-            f"{normalized_name} to one exact package-index version"
-        )
-    version_text = specifiers[0].version
-    try:
-        Version(version_text)
-    except InvalidVersion as exception:
-        raise SiteBuildError(
-            f"{parent_distribution} has an invalid dependency version"
-        ) from exception
-    return normalized_name, version_text
-
-
-def _release_metadata(
-    requirement: Requirement,
-    *,
-    parent_distribution: str,
-    package_index: str,
-    client: JsonMetadataClient,
-) -> tuple[str, BaseMarker, Mapping[str, object], WheelEnvironments]:
-    distribution_name, requested_version = _exact_index_requirement(
-        requirement, parent_distribution
-    )
-    index = _PACKAGE_INDEXES[package_index]
-    url = index["release_api"].format(
-        distribution=quote(distribution_name, safe="-"),
-        version=quote(requested_version, safe=""),
-    )
-    value = client.get_json(url)
-    document = _mapping(
-        value, f"package release metadata for {distribution_name}"
-    )
-    info = _mapping(
-        document.get("info"), f"package release info for {distribution_name}"
-    )
-    reported_name = _string(info.get("name"), "package release info.name")
-    reported_version = _string(info.get("version"), "package release info.version")
-    if not isinstance(reported_version, str):
-        _fail(f"package release version is missing for {distribution_name}")
-    try:
-        release_version = Version(reported_version)
-    except InvalidVersion as exception:
-        raise SiteBuildError(
-            f"package release version is invalid for {distribution_name}"
-        ) from exception
-    if (
-        not isinstance(reported_name, str)
-        or canonicalize_name(reported_name) != distribution_name
-        or not requirement.specifier.contains(reported_version, prereleases=True)
-    ):
-        _fail(
-            f"package release metadata identity does not match {requirement}"
-        )
-    file_metadata, wheel_tags = _package_file_metadata(
-        document, distribution_name, reported_version, release_version
-    )
-    if file_metadata["wheel_count"] == 0:
-        _fail(f"{distribution_name} does not publish a non-yanked wheel")
-    requires_python = _string(
-        info.get("requires_python"),
-        "package release info.requires_python",
-        nullable=True,
-    )
-    python_environment = _python_environment_marker(
-        requires_python, distribution_name
-    )
-    if not _wheel_set_matches_environment(
-        wheel_tags, python_environment
-    ):
-        _fail(
-            f"{distribution_name} has no non-yanked wheel compatible with "
-            "its Requires-Python on a supported registry platform"
-        )
-    return (
-        reported_version,
-        python_environment,
-        info,
-        wheel_tags,
-    )
-
-
-def _pip_install_arguments(
-    index_url: str, requirements: tuple[str, ...]
-) -> list[str]:
-    return [
-        *_PIP_COMMAND,
-        "install",
-        "--force-reinstall",
-        "--no-deps",
-        "--only-binary=:all:",
-        "--index-url",
-        index_url,
-        *requirements,
-    ]
-
-
-def _validate_public_wheel_closure(
-    public_lock: tuple[str, ...],
-    *,
-    distribution_name: str,
-    client: JsonMetadataClient,
-    python_environment: BaseMarker,
-    selected_conditions: Mapping[tuple[str, str], BaseMarker],
-    release_python_environments: Mapping[tuple[str, str], BaseMarker],
-    release_wheel_tags: Mapping[tuple[str, str], WheelEnvironments],
-) -> None:
-    # Keep these separate from the caller's TestPyPI pins: public dependencies
-    # participate in validation, never in the TestPyPI installation step.
-    conditions = dict(selected_conditions)
-    environments = dict(release_python_environments)
-    wheel_tags = dict(release_wheel_tags)
-    requirements = tuple(map(Requirement, public_lock))
-    public_conditions: list[tuple[tuple[str, str], BaseMarker]] = []
-
-    def load(
-        requirement: Requirement,
-    ) -> tuple[str, BaseMarker, Mapping[str, object], WheelEnvironments]:
-        return _release_metadata(
-            requirement,
-            parent_distribution=distribution_name,
-            package_index="pypi",
-            client=client,
-        )
-
-    with ThreadPoolExecutor(
-        max_workers=min(METADATA_MAX_WORKERS, len(requirements)),
-        thread_name_prefix="registry-public-wheels",
-    ) as executor:
-        for requirement, (version, release_environment, _metadata, tags) in zip(
-            requirements, executor.map(load, requirements), strict=True
-        ):
-            key = (canonicalize_name(requirement.name), version)
-            condition = (
-                AnyMarker()
-                if requirement.marker is None
-                else from_pkg_marker(requirement.marker)
-            )
-            public_conditions.append((key, condition))
-            conditions[key] = MarkerUnion.of(
-                conditions.get(key, EmptyMarker()), condition
-            )
-            environments[key] = intersection(
-                environments.get(key, AnyMarker()), release_environment
-            )
-            previous = wheel_tags.get(key)
-            wheel_tags[key] = (
-                tags
-                if previous is None
-                else {
-                    tag: intersection(previous[tag], tags[tag])
-                    for tag in previous.keys() & tags.keys()
-                }
-            )
-
-    root_keys = [
-        key for key in conditions if key[0] == canonicalize_name(distribution_name)
-    ]
-    if len(root_keys) != 1:
-        _fail(
-            f"wheel closure must contain one provider release for {distribution_name}"
-        )
-    root_key = root_keys[0]
-    provider_python_environment = intersection(
-        python_environment, environments[root_key]
-    )
-    for key, condition in public_conditions:
-        if key == root_key:
-            continue
-        # Check each provider tag as well as every original lock condition;
-        # merging tags or conditions must not hide missing dependency coverage.
-        if not _dependency_wheels_cover_provider(
-            wheel_tags[root_key],
-            wheel_tags[key],
-            provider_python_environment=provider_python_environment,
-            dependency_python_environment=environments[key],
-            condition=condition,
-        ):
-            _fail(
-                f"{distribution_name} wheel closure has no common environment "
-                f"for {key[0]}=={key[1]} in some provider environments "
-                "where its lock marker applies"
-            )
-
-    _validate_wheel_closure(
-        distribution_name,
-        conditions,
-        environments,
-        wheel_tags,
-        environment=python_environment,
-    )
 
 
 def _posix_install_script(commands: list[list[str]]) -> str | None:
@@ -1686,10 +496,7 @@ def _powershell_install_script(commands: list[list[str]]) -> str | None:
                 f"    & {quoted_arguments}",
                 "    $__vanePipSucceeded = $?",
                 "    $__vanePipExitCode = $LASTEXITCODE",
-                (
-                    "    if (-not $__vanePipSucceeded -or "
-                    "$__vanePipExitCode -ne 0) {"
-                ),
+                ("    if (-not $__vanePipSucceeded -or $__vanePipExitCode -ne 0) {"),
                 '      throw "pip exited with code $__vanePipExitCode"',
                 "    }",
             ]
@@ -1709,309 +516,48 @@ def _powershell_install_script(commands: list[list[str]]) -> str | None:
     return "\n".join(lines)
 
 
-def _testpypi_install_arguments(
-    distribution_name: str,
-    version_text: str,
-    requires_python: object,
-    requirements: tuple[Requirement, ...],
-    provider_wheel_tags: WheelEnvironments,
-    client: JsonMetadataClient,
-    public_resolver: PublicDependencyResolver,
-) -> list[list[str]]:
-    root_name = canonicalize_name(distribution_name)
-    python_environment = _python_environment_marker(
-        requires_python, distribution_name
-    )
-    provider_environment = intersection(
-        python_environment, MarkerUnion.of(*provider_wheel_tags.values())
-    )
-    if provider_environment.is_empty():
-        _fail(
-            f"{distribution_name} has no non-yanked wheel compatible with "
-            "its Requires-Python on a supported registry platform"
-        )
-    root_key = (root_name, version_text)
-    selected_conditions: dict[tuple[str, str], BaseMarker] = {
-        root_key: AnyMarker()
-    }
-    release_requirements: dict[
-        tuple[str, str], tuple[Requirement, ...]
-    ] = {root_key: requirements}
-    release_python_environments: dict[tuple[str, str], BaseMarker] = {
-        root_key: python_environment
-    }
-    release_wheel_tags: dict[tuple[str, str], WheelEnvironments] = {
-        root_key: provider_wheel_tags
-    }
-    release_aliases: dict[tuple[str, str], tuple[str, str]] = {}
-    pending = [(requirement, AnyMarker()) for requirement in requirements]
-    public_requirements: set[str] = set()
-    while pending:
-        raw_requirement, inherited_condition = pending.pop()
-        conditioned = _conditioned_requirement(
-            raw_requirement,
-            inherited_condition,
-            provider_environment,
-            distribution_name,
-        )
-        if conditioned is None:
-            continue
-        requirement, condition = conditioned
-        normalized_name = canonicalize_name(requirement.name)
-        if not _is_vane_distribution(normalized_name):
-            if requirement.url is not None:
-                _fail(
-                    f"{distribution_name} has an unsupported direct URL dependency"
-                )
-            public_requirements.add(
-                _requirement_with_condition(requirement, condition)
-            )
-            if len(public_requirements) > PACKAGE_REQUIREMENTS_MAX_COUNT:
-                _fail(f"public dependency closure is too large for {distribution_name}")
-            continue
-        dependency_name, requested_version = _exact_index_requirement(
-            requirement, distribution_name
-        )
-        selected_key = next(
-            (
-                key
-                for key in selected_conditions
-                if key[0] == dependency_name
-                and requirement.specifier.contains(key[1], prereleases=True)
-            ),
-            None,
-        )
-        if selected_key is None:
-            alias = (dependency_name, requested_version)
-            selected_key = release_aliases.get(alias)
-            if selected_key is None:
-                (
-                    reported_version,
-                    child_python_environment,
-                    child_metadata,
-                    child_wheel_tags,
-                ) = _release_metadata(
-                    requirement,
-                    parent_distribution=distribution_name,
-                    package_index="testpypi",
-                    client=client,
-                )
-                selected_key = (dependency_name, reported_version)
-                release_aliases[alias] = selected_key
-                release_requirements.setdefault(
-                    selected_key,
-                    _package_requirements(child_metadata, dependency_name),
-                )
-                release_python_environments.setdefault(
-                    selected_key, child_python_environment
-                )
-                release_wheel_tags.setdefault(selected_key, child_wheel_tags)
-
-        dependency_python_environment = release_python_environments[selected_key]
-        unsupported_environment = intersection(
-            provider_environment,
-            condition,
-            ~dependency_python_environment,
-        )
-        if not unsupported_environment.is_empty():
-            _fail(
-                f"{dependency_name}=={selected_key[1]} Requires-Python is "
-                f"incompatible with {distribution_name}"
-            )
-        if not _dependency_wheels_cover_provider(
-            provider_wheel_tags,
-            release_wheel_tags[selected_key],
-            provider_python_environment=python_environment,
-            dependency_python_environment=dependency_python_environment,
-            condition=condition,
-        ):
-            _fail(
-                f"{dependency_name}=={selected_key[1]} has no non-yanked wheel "
-                f"compatible with {distribution_name} in some applicable "
-                "provider environments"
-            )
-        for other_key, other_condition in selected_conditions.items():
-            if (
-                other_key[0] == dependency_name
-                and other_key != selected_key
-                and _conditions_overlap(
-                    provider_environment, condition, other_condition
-                )
-            ):
-                _fail(f"Vane dependency versions conflict for {dependency_name}")
-
-        previous_condition = selected_conditions.get(selected_key)
-        merged_condition = (
-            condition
-            if previous_condition is None
-            else MarkerUnion.of(previous_condition, condition)
-        )
-        if previous_condition is not None and merged_condition == previous_condition:
-            continue
-        if (
-            previous_condition is None
-            and len(selected_conditions) >= VANE_REQUIREMENTS_MAX_COUNT
-        ):
-            _fail(f"Vane dependency closure is too large for {distribution_name}")
-        selected_conditions[selected_key] = merged_condition
-        pending.extend(
-            (child_requirement, condition)
-            for child_requirement in release_requirements[selected_key]
-        )
-
-    _validate_wheel_closure(
-        distribution_name,
-        selected_conditions,
-        release_python_environments,
-        release_wheel_tags,
-        environment=python_environment,
-    )
-    commands: list[list[str]] = []
-    if public_requirements:
-        if not isinstance(requires_python, str):
-            _fail(
-                f"{distribution_name} must declare Requires-Python to resolve "
-                "public dependencies"
-            )
-        public_lock = public_resolver.resolve(
-            tuple(sorted(public_requirements, key=str.casefold)),
-            requires_python=requires_python,
-            distribution_name=distribution_name,
-            reject_vane=True,
-        )
-        if public_lock:
-            _validate_public_wheel_closure(
-                public_lock,
-                distribution_name=distribution_name,
-                client=client,
-                python_environment=python_environment,
-                selected_conditions=selected_conditions,
-                release_python_environments=release_python_environments,
-                release_wheel_tags=release_wheel_tags,
-            )
-            commands.append(
-                _pip_install_arguments(
-                    _PACKAGE_INDEXES["pypi"]["simple"], public_lock
-                )
-            )
-    commands.append(
-        _pip_install_arguments(
-            _PACKAGE_INDEXES["testpypi"]["simple"],
-            tuple(
-                _internal_pin_with_condition(name, version, condition)
-                for (name, version), condition in sorted(
-                    selected_conditions.items()
-                )
-            ),
-        )
-    )
-    return commands
-
-
-def _pypi_install_arguments(
-    distribution_name: str,
-    version_text: str,
-    package: Mapping[str, object],
-    client: JsonMetadataClient,
-    public_resolver: PublicDependencyResolver,
-) -> list[str]:
-    if package["wheel_count"] == 0:
-        _fail(f"{distribution_name} does not publish a non-yanked wheel")
-    requires_python = package["requires_python"]
-    if not isinstance(requires_python, str):
-        _fail(
-            f"{distribution_name} must declare Requires-Python to resolve "
-            "its PyPI dependency closure"
-        )
-    locked_requirements = public_resolver.resolve(
-        (f"{distribution_name}==={version_text}",),
-        requires_python=requires_python,
-        distribution_name=distribution_name,
-        reject_vane=False,
-    )
-    root_name = canonicalize_name(distribution_name)
-    root_requirements = tuple(
-        requirement
-        for requirement in map(Requirement, locked_requirements)
-        if canonicalize_name(requirement.name) == root_name
-    )
-    if (
-        len(root_requirements) != 1
-        or not root_requirements[0].specifier.contains(
-            version_text, prereleases=True
-        )
-    ):
-        _fail(f"PyPI dependency lock omits {distribution_name}")
-    root = root_requirements[0]
-    if root.marker is not None:
-        supported = _python_environment_marker(requires_python, distribution_name)
-        if not intersection(supported, ~from_pkg_marker(root.marker)).is_empty():
-            _fail(
-                "PyPI dependency lock omits supported environments for "
-                f"{distribution_name}"
-            )
-        # Keep the provider itself unconditional so pip reports an unsupported
-        # interpreter instead of silently skipping the entire installation.
-        root.marker = None
-        locked_requirements = tuple(
-            str(root)
-            if canonicalize_name(Requirement(text).name) == root_name
-            else text
-            for text in locked_requirements
-        )
-    _validate_public_wheel_closure(
-        locked_requirements,
-        distribution_name=distribution_name,
-        client=client,
-        python_environment=_python_environment_marker(
-            requires_python, distribution_name
-        ),
-        selected_conditions={},
-        release_python_environments={},
-        release_wheel_tags={},
-    )
-    return _pip_install_arguments(
-        _PACKAGE_INDEXES["pypi"]["simple"], locked_requirements
-    )
-
-
 def _installation_metadata(
     extension_name: str,
     distribution_name: str,
     package_index: str,
     package: Mapping[str, object],
-    requirements: tuple[Requirement, ...],
-    provider_wheel_tags: WheelEnvironments,
-    client: JsonMetadataClient,
-    public_resolver: PublicDependencyResolver,
+    resolver: InstallationResolver,
 ) -> dict[str, object]:
     version_text = package["latest_version"]
     if not package["published"]:
         install_arguments: list[list[str]] = []
     elif not isinstance(version_text, str):
         _fail(f"published package version is missing for {distribution_name}")
-    elif package_index == "testpypi":
+    else:
         if package["wheel_count"] == 0:
             _fail(f"{distribution_name} does not publish a non-yanked wheel")
-        install_arguments = _testpypi_install_arguments(
-            distribution_name,
-            version_text,
-            package["requires_python"],
-            requirements,
-            provider_wheel_tags,
-            client,
-            public_resolver,
-        )
-    else:
-        install_arguments = [
-            _pypi_install_arguments(
-                distribution_name,
-                version_text,
-                package,
-                client,
-                public_resolver,
+        requires_python = package["requires_python"]
+        if not isinstance(requires_python, str) or not requires_python:
+            _fail(f"{distribution_name} must declare Requires-Python")
+        try:
+            resolved = resolver.resolve(
+                distribution_name=distribution_name,
+                version=version_text,
+                requires_python=requires_python,
+                package_index=package_index,
             )
+        except ResolutionError as exception:
+            raise SiteBuildError(str(exception)) from exception
+        install_arguments = [
+            [
+                *_PIP_COMMAND,
+                "install",
+                "--force-reinstall",
+                "--no-deps",
+                "--only-binary=:all:",
+                "--index-url",
+                INDEX_URLS[index],
+                *pins,
+            ]
+            for index in ("pypi", "testpypi")
+            if (pins := resolved[index])
         ]
+        install_arguments.append([*_PIP_COMMAND, "check"])
     posix_install_script = _posix_install_script(install_arguments)
     powershell_install_script = _powershell_install_script(install_arguments)
     if any(
@@ -2022,7 +568,7 @@ def _installation_metadata(
         _fail(f"generated install script is too long for {distribution_name}")
     load_example = (
         "import vane\n\n"
-        'connection = vane.connect(\":memory:\")\n'
+        'connection = vane.connect(":memory:")\n'
         f'vane.load_installed_extension("{extension_name}", connection=connection)'
     )
     return {
@@ -2038,15 +584,13 @@ def _detail_record(
     generated_at: str,
     client: JsonMetadataClient,
     github_token: str | None,
-    public_resolver: PublicDependencyResolver,
+    resolver: InstallationResolver,
 ) -> dict[str, object]:
     extension_name = str(manifest["extension_name"])
     distribution_name = str(manifest["distribution_name"])
     repository = str(manifest["repository"])
     package_index = str(manifest["package_index"])
-    package, requirements, provider_wheel_tags = _package_metadata(
-        distribution_name, package_index, client
-    )
+    package = _package_metadata(distribution_name, package_index, client)
     metrics = _download_metadata(
         distribution_name, package_index, bool(package["published"]), client
     )
@@ -2069,10 +613,7 @@ def _detail_record(
             distribution_name,
             package_index,
             package,
-            requirements,
-            provider_wheel_tags,
-            client,
-            public_resolver,
+            resolver,
         ),
         "metrics": metrics,
     }
@@ -2084,13 +625,14 @@ def build_details(
     generated_at: str,
     client: JsonMetadataClient,
     github_token: str | None = None,
-    public_resolver: PublicDependencyResolver = _PUBLIC_DEPENDENCY_RESOLVER,
+    resolver: InstallationResolver | None = None,
 ) -> tuple[dict[str, object], ...]:
     """Return enriched detail records for every reviewed manifest."""
     _timestamp(generated_at, "generated_at")
     manifests = load_manifests(manifest_root)
     if not manifests:
         _fail("registry must contain at least one extension manifest")
+    resolver = resolver if resolver is not None else PdmInstallationResolver()
     with ThreadPoolExecutor(
         max_workers=min(METADATA_MAX_WORKERS, len(manifests)),
         thread_name_prefix="registry-metadata",
@@ -2102,7 +644,7 @@ def build_details(
                     generated_at=generated_at,
                     client=client,
                     github_token=github_token,
-                    public_resolver=public_resolver,
+                    resolver=resolver,
                 ),
                 manifests,
             )
@@ -2162,9 +704,7 @@ def _detail_html(detail: Mapping[str, object]) -> str:
     if not isinstance(maintainers, list):
         _fail("maintainers must be a list")
     latest_version = (
-        str(package["latest_version"])
-        if package["published"]
-        else "Not published"
+        str(package["latest_version"]) if package["published"] else "Not published"
     )
     python_versions = ", ".join(str(value) for value in package["python_versions"])
     if not python_versions:
@@ -2201,8 +741,7 @@ def _detail_html(detail: Mapping[str, object]) -> str:
         platform_tags=platform_tags,
         downloads=downloads,
         machine_url=(
-            "../../v1/extensions/"
-            f"{quote(str(detail['extension_name']), safe='')}.json"
+            f"../../v1/extensions/{quote(str(detail['extension_name']), safe='')}.json"
         ),
     )
 
@@ -2213,6 +752,7 @@ def assemble_site(
     generated_at: str,
     client: JsonMetadataClient,
     github_token: str | None = None,
+    resolver: InstallationResolver | None = None,
 ) -> tuple[dict[str, object], ...]:
     """Create a complete Pages tree without modifying the stable source catalog."""
     if output.exists():
@@ -2224,6 +764,7 @@ def assemble_site(
         generated_at=generated_at,
         client=client,
         github_token=github_token,
+        resolver=resolver,
     )
 
     (output / "v1" / "extensions").mkdir(parents=True)
@@ -2255,9 +796,7 @@ def assemble_site(
                 {
                     "extension_name": detail["extension_name"],
                     "distribution_name": detail["distribution_name"],
-                    "package_index": _mapping(detail["package"], "package")[
-                        "index"
-                    ],
+                    "package_index": _mapping(detail["package"], "package")["index"],
                     **dict(_mapping(detail["metrics"], "metrics")),
                 }
                 for detail in details
@@ -2266,9 +805,7 @@ def assemble_site(
     )
     for detail in details:
         extension_name = str(detail["extension_name"])
-        _write_json(
-            output / "v1" / "extensions" / f"{extension_name}.json", detail
-        )
+        _write_json(output / "v1" / "extensions" / f"{extension_name}.json", detail)
         detail_directory = output / "extensions" / extension_name
         detail_directory.mkdir(parents=True)
         (detail_directory / "index.html").write_text(
