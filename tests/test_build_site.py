@@ -1033,6 +1033,98 @@ class BuildSiteTests(unittest.TestCase):
             ],
         )
 
+    def test_optional_download_metrics_do_not_block_a_published_provider(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        manifest["package_index"] = "pypi"
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        public_resolver = _FakePublicDependencyResolver((f"{distribution}==0.2.0",))
+        responses = {
+            f"https://api.github.com/repos/{slug}": _github_response(repository),
+            f"https://pypi.org/pypi/{distribution}/json": _package_response(
+                distribution
+            ),
+            **_public_release_responses(*public_resolver.resolved),
+        }
+        outcomes = {
+            "timeout": httpx.ReadTimeout("metrics timeout"),
+            "connection-error": httpx.ConnectError("metrics offline"),
+            "rate-limit": httpx.Response(429),
+            "server-error": httpx.Response(503),
+            "invalid-json": httpx.Response(200, content=b"{"),
+            "missing-data": httpx.Response(200, json={}),
+            "invalid-data": httpx.Response(200, json={"data": []}),
+            "missing-count": httpx.Response(200, json={"data": {}}),
+            "negative-count": httpx.Response(200, json={"data": {"last_week": -1}}),
+            "boolean-count": httpx.Response(200, json={"data": {"last_week": True}}),
+            "missing-metrics": httpx.Response(404),
+        }
+        for case, outcome in outcomes.items():
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if request.url.host == "pypistats.org":
+                    if isinstance(outcome, Exception):
+                        raise outcome
+                    return outcome
+                return httpx.Response(200, json=responses[str(request.url)])
+
+            log_check = (
+                self.assertNoLogs("scripts.build_site", level="WARNING")
+                if case == "missing-metrics"
+                else self.assertLogs("scripts.build_site", level="WARNING")
+            )
+            with (
+                self.subTest(case=case),
+                MetadataClient(transport=httpx.MockTransport(handler)) as client,
+                log_check,
+            ):
+                detail = build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=client,
+                    public_resolver=public_resolver,
+                )[0]
+                self.assertEqual(
+                    detail["metrics"], {"downloads_last_week": None, "source": None}
+                )
+                self.assertIsNotNone(detail["installation"]["posix_install_script"])
+                self.assertIn("Unavailable (pypi)", _detail_html(detail))
+
+    def test_optional_metrics_do_not_hide_required_metadata_failures(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        manifest["package_index"] = "pypi"
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        github_url = f"https://api.github.com/repos/{slug}"
+        package_url = f"https://pypi.org/pypi/{distribution}/json"
+        responses = {
+            github_url: _github_response(repository),
+            package_url: _package_response(distribution),
+        }
+        for failed_url in (github_url, package_url):
+
+            def handler(request: httpx.Request) -> httpx.Response:
+                if (
+                    str(request.url) == failed_url
+                    or request.url.host == "pypistats.org"
+                ):
+                    return httpx.Response(503)
+                return httpx.Response(200, json=responses[str(request.url)])
+
+            with (
+                self.subTest(failed_url=failed_url),
+                MetadataClient(transport=httpx.MockTransport(handler)) as client,
+                patch("scripts.build_site._LOGGER.warning"),
+                self.assertRaisesRegex(SiteBuildError, "HTTP 503"),
+            ):
+                build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=client,
+                )
+
     def test_pypi_recipe_requires_a_wheel_for_the_provider(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
         manifest["package_index"] = "pypi"

@@ -134,7 +134,11 @@ versions and wheel/Python platform availability are derived from the manifest's
 explicit Python package index while GitHub stars come from the repository API.
 PyPI download estimates from `pypistats.org` are published in a separate
 metrics document; TestPyPI does not expose meaningful download counts, so those
-values are `null`. No direct artifact URL, hash, or trust identity is published
+values are `null`. Unavailable or invalid PyPIStats responses also produce
+`null` metrics instead of blocking publication. Fetch and response-validation
+errors emit a build warning; GitHub identity and package/dependency validation
+errors still fail the build.
+No direct artifact URL, hash, or trust identity is published
 by the registry: those values belong to immutable provider packages and their
 Vane descriptors.
 

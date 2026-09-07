@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import secrets
@@ -61,6 +62,7 @@ from scripts.build_catalog import (
 )
 
 DETAIL_FORMAT_VERSION = 1
+_LOGGER = logging.getLogger(__name__)
 DETAIL_MAX_JSON_BYTES = 1024 * 1024
 AGGREGATE_MAX_JSON_BYTES = 8 * 1024 * 1024
 REMOTE_METADATA_MAX_BYTES = 8 * 1024 * 1024
@@ -519,17 +521,26 @@ def _download_metadata(
     published: bool,
     client: JsonMetadataClient,
 ) -> dict[str, object]:
+    unavailable = {"downloads_last_week": None, "source": None}
     if package_index != "pypi" or not published:
-        return {"downloads_last_week": None, "source": None}
+        return unavailable
     url = f"https://pypistats.org/api/packages/{quote(distribution_name, safe='-')}/recent"
-    value = client.get_json(url, allow_not_found=True)
-    if value is None:
-        return {"downloads_last_week": None, "source": None}
-    document = _mapping(value, f"download metadata for {distribution_name}")
-    data = _mapping(document.get("data"), f"download data for {distribution_name}")
-    downloads = data.get("last_week")
-    if type(downloads) is not int or downloads < 0:
-        _fail(f"download count is invalid for {distribution_name}")
+    try:
+        value = client.get_json(url, allow_not_found=True)
+        if value is None:
+            return unavailable
+        document = _mapping(value, f"download metadata for {distribution_name}")
+        data = _mapping(document.get("data"), f"download data for {distribution_name}")
+        downloads = data.get("last_week")
+        if type(downloads) is not int or downloads < 0:
+            _fail(f"download count is invalid for {distribution_name}")
+    except SiteBuildError as exception:
+        # Statistics are optional, unlike repository identity and package
+        # metadata. Do not make a PyPIStats outage an installation-service gate.
+        _LOGGER.warning(
+            "Download metrics unavailable for %s: %s", distribution_name, exception
+        )
+        return unavailable
     return {"downloads_last_week": downloads, "source": "pypistats.org"}
 
 
