@@ -250,6 +250,85 @@ class PublicDependencyResolverTests(unittest.TestCase):
                     ):
                         _pypi_install_arguments(*arguments)
 
+    def test_public_wheels_must_work_where_each_lock_condition_applies(self) -> None:
+        name = "vane-extension-test"
+        for case, root_tag, helper_tag, helper_python, conditions, succeeds in (
+            (
+                "wrong-platform",
+                "py3-none-any",
+                "py3-none-manylinux_2_28_x86_64",
+                None,
+                ('sys_platform == "win32"',),
+                False,
+            ),
+            (
+                "wrong-file-python",
+                "py3-none-any",
+                "py3-none-any",
+                ">=3.12",
+                ('python_version < "3.12"',),
+                False,
+            ),
+            (
+                "merged-conditions",
+                "py3-none-any",
+                "py3-none-manylinux_2_28_x86_64",
+                None,
+                ('sys_platform == "linux"', 'sys_platform == "win32"'),
+                False,
+            ),
+            (
+                "matching-platform",
+                "py3-none-any",
+                "py3-none-win_amd64",
+                None,
+                ('sys_platform == "win32"',),
+                True,
+            ),
+            (
+                "inactive-platform",
+                "py3-none-manylinux_2_28_x86_64",
+                "py3-none-manylinux_2_28_x86_64",
+                None,
+                ('sys_platform == "win32"',),
+                True,
+            ),
+        ):
+            pins = (
+                f"{name}==1.0",
+                *(f"helper==1.0; {condition}" for condition in conditions),
+            )
+            responses = {
+                f"https://pypi.org/pypi/{name}/1.0/json": _release_response(
+                    name,
+                    "1.0",
+                    [],
+                    wheel_tags=(root_tag,),
+                ),
+                "https://pypi.org/pypi/helper/1.0/json": _release_response(
+                    "helper",
+                    "1.0",
+                    [],
+                    wheel_tags=(helper_tag,),
+                    file_requires_python=(helper_python,),
+                ),
+            }
+            arguments = (
+                name,
+                "1.0",
+                {"wheel_count": 1, "requires_python": ">=3.10,<3.15"},
+                _FakeMetadataClient(responses),
+                _FakePublicDependencyResolver(pins),
+            )
+            with self.subTest(case=case):
+                if succeeds:
+                    self.assertIn(f"{name}==1.0", _pypi_install_arguments(*arguments))
+                else:
+                    with self.assertRaisesRegex(
+                        SiteBuildError, "where its lock marker applies"
+                    ):
+                        _pypi_install_arguments(*arguments)
+
     def test_pypi_wheel_validation_stays_within_declared_python_range(self) -> None:
         name = "vane-extension-test"
         pins = (f"{name}==1.0", 'public-sdk==1.0; python_version >= "3.10"')
@@ -2259,6 +2338,14 @@ class BuildSiteTests(unittest.TestCase):
                 (windows_tag,),
                 'sys_platform == "win32"',
                 True,
+            ),
+            "conditional-public-wrong-platform": (
+                universal_tag, universal_tag, (linux_tag,),
+                'sys_platform == "win32"', False,
+            ),
+            "conditional-public-wrong-python": (
+                universal_tag, universal_tag, ("cp314-none-manylinux_2_28_x86_64",),
+                'python_version < "3.12"', False,
             ),
             "compatible-public-wheel": (
                 linux_tag,

@@ -99,8 +99,10 @@ addition to the release-level constraint. Files sharing a tag remain alternative
 environments, including disjoint Python ranges; they are not collapsed into one
 broader range. After public resolution, the exact PyPI
 release wheel metadata is fetched concurrently and added to the same common-
-environment check, with each lock marker preserved. A universal public lock
-alone does not prove compatibility with a provider's platform. Public pins
+environment check, with each lock marker preserved. Before that aggregate search,
+each public pin is checked against provider wheels where its lock marker applies,
+using the same conditional-overlap validation as internal dependencies. A universal
+public lock alone does not prove compatibility with a provider's platform. Public pins
 remain separate from the TestPyPI installation step. Their dependency metadata
 is resolved by `uv`, not re-parsed by the Vane-owned dependency graph walker.
 Native ABI validation covers CPython and PyPy's documented `pp73` ABI revision;

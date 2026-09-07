@@ -1436,6 +1436,7 @@ def _validate_public_wheel_closure(
     environments = dict(release_python_environments)
     wheel_tags = dict(release_wheel_tags)
     requirements = tuple(map(Requirement, public_lock))
+    public_conditions: list[tuple[tuple[str, str], BaseMarker]] = []
 
     def load(
         requirement: Requirement,
@@ -1460,6 +1461,7 @@ def _validate_public_wheel_closure(
                 if requirement.marker is None
                 else from_pkg_marker(requirement.marker)
             )
+            public_conditions.append((key, condition))
             conditions[key] = MarkerUnion.of(
                 conditions.get(key, EmptyMarker()), condition
             )
@@ -1474,6 +1476,35 @@ def _validate_public_wheel_closure(
                     tag: intersection(previous[tag], tags[tag])
                     for tag in previous.keys() & tags.keys()
                 }
+            )
+
+    root_keys = [
+        key for key in conditions if key[0] == canonicalize_name(distribution_name)
+    ]
+    if len(root_keys) != 1:
+        _fail(
+            f"wheel closure must contain one provider release for {distribution_name}"
+        )
+    root_key = root_keys[0]
+    provider_python_environment = intersection(
+        python_environment, environments[root_key]
+    )
+    for key, condition in public_conditions:
+        if key == root_key:
+            continue
+        # An existential whole-closure search can choose an inactive branch.
+        # Validate every lock condition before allowing that shortcut, keeping
+        # separate conditions even when pins for the same release are merged.
+        if not _wheel_sets_overlap(
+            wheel_tags[root_key],
+            wheel_tags[key],
+            provider_python_environment=provider_python_environment,
+            dependency_python_environment=environments[key],
+            condition=condition,
+        ):
+            _fail(
+                f"{distribution_name} wheel closure has no common environment "
+                f"for {key[0]}=={key[1]} where its lock marker applies"
             )
 
     _validate_wheel_closure(
