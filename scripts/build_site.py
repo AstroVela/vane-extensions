@@ -63,6 +63,9 @@ from scripts.build_catalog import (
 
 DETAIL_FORMAT_VERSION = 1
 _LOGGER = logging.getLogger(__name__)
+# A tag may occur in several files. Its value is the union of those files'
+# tag/Python environments, not the release-wide Requires-Python alone.
+WheelEnvironments = Mapping[Tag, BaseMarker]
 DETAIL_MAX_JSON_BYTES = 1024 * 1024
 AGGREGATE_MAX_JSON_BYTES = 8 * 1024 * 1024
 REMOTE_METADATA_MAX_BYTES = 8 * 1024 * 1024
@@ -354,7 +357,7 @@ def _package_file_metadata(
     distribution_name: str,
     version_text: str,
     version: Version,
-) -> tuple[dict[str, object], frozenset[Tag]]:
+) -> tuple[dict[str, object], WheelEnvironments]:
     raw_files = document.get("urls")
     if not isinstance(raw_files, list):
         _fail(f"package urls must be a list for {distribution_name}")
@@ -363,7 +366,7 @@ def _package_file_metadata(
     python_tags: set[str] = set()
     abi_tags: set[str] = set()
     platform_tags: set[str] = set()
-    available_wheel_tags: set[Tag] = set()
+    available_wheel_tags: dict[Tag, BaseMarker] = {}
     upload_times: list[tuple[datetime, str]] = []
     for raw_file in raw_files:
         package_file = _mapping(raw_file, f"package file for {distribution_name}")
@@ -409,10 +412,16 @@ def _package_file_metadata(
         ):
             _fail(f"wheel identity does not match {distribution_name}=={version_text}")
         wheel_count += 1
-        available_wheel_tags.update(parsed_tags)
-        if len(available_wheel_tags) > PACKAGE_WHEEL_TAGS_MAX_COUNT:
+        if len(available_wheel_tags.keys() | parsed_tags) > PACKAGE_WHEEL_TAGS_MAX_COUNT:
             _fail(f"package has too many wheel tags for {distribution_name}")
+        file_python_environment = _python_environment_marker(
+            package_file.get("requires_python"), distribution_name, allow_empty=True
+        )
         for tag in parsed_tags:
+            available_wheel_tags[tag] = MarkerUnion.of(
+                available_wheel_tags.get(tag, EmptyMarker()),
+                intersection(file_python_environment, _wheel_tag_environment(tag)),
+            )
             python_tags.add(tag.interpreter)
             abi_tags.add(tag.abi)
             platform_tags.add(tag.platform)
@@ -432,13 +441,13 @@ def _package_file_metadata(
             "platform_tags": sorted(platform_tags),
             "latest_release_uploaded_at": latest_release_uploaded_at,
         },
-        frozenset(available_wheel_tags),
+        available_wheel_tags,
     )
 
 
 def _package_metadata(
     distribution_name: str, package_index: str, client: JsonMetadataClient
-) -> tuple[dict[str, object], tuple[Requirement, ...], frozenset[Tag]]:
+) -> tuple[dict[str, object], tuple[Requirement, ...], WheelEnvironments]:
     index = _PACKAGE_INDEXES[package_index]
     escaped_distribution = quote(distribution_name, safe="-")
     api_url = index["api"].format(distribution=escaped_distribution)
@@ -461,7 +470,7 @@ def _package_metadata(
                 "latest_release_uploaded_at": None,
             },
             (),
-            frozenset(),
+            {},
         )
 
     document = _mapping(value, f"package metadata for {distribution_name}")
@@ -592,11 +601,11 @@ def _requirement_for_base_install(requirement: Requirement) -> Requirement | Non
 
 
 def _python_environment_marker(
-    requires_python: object, distribution_name: str
+    requires_python: object, distribution_name: str, *, allow_empty: bool = False
 ) -> BaseMarker:
     if requires_python is None:
         return AnyMarker()
-    if not isinstance(requires_python, str):
+    if not isinstance(requires_python, str) or len(requires_python) > 4096:
         _fail(f"package Requires-Python is invalid for {distribution_name}")
     try:
         specifiers = SpecifierSet(requires_python)
@@ -614,7 +623,7 @@ def _python_environment_marker(
         raise SiteBuildError(
             f"package Requires-Python is invalid for {distribution_name}"
         ) from exception
-    if environment.is_empty():
+    if environment.is_empty() and not allow_empty:
         _fail(f"package Requires-Python is empty for {distribution_name}")
     return environment
 
@@ -873,39 +882,39 @@ def _wheel_tags_overlap(left: Tag, right: Tag) -> bool:
 
 
 def _wheel_set_matches_environment(
-    wheel_tags: frozenset[Tag], environment: BaseMarker
+    wheel_tags: WheelEnvironments, environment: BaseMarker
 ) -> bool:
     return any(
-        not MultiMarker.of(environment, _wheel_tag_environment(tag)).is_empty()
-        for tag in wheel_tags
+        not intersection(environment, wheel_environment).is_empty()
+        for wheel_environment in wheel_tags.values()
     )
 
 
 def _wheel_sets_overlap(
-    provider_tags: frozenset[Tag],
-    dependency_tags: frozenset[Tag],
+    provider_tags: WheelEnvironments,
+    dependency_tags: WheelEnvironments,
     *,
     provider_python_environment: BaseMarker,
     dependency_python_environment: BaseMarker,
     condition: BaseMarker,
 ) -> bool:
     applicable = False
-    for provider_tag in provider_tags:
+    for provider_tag, provider_file_environment in provider_tags.items():
         provider_environment = intersection(
             provider_python_environment,
             condition,
-            _wheel_tag_environment(provider_tag),
+            provider_file_environment,
         )
         if provider_environment.is_empty():
             continue
         applicable = True
-        for dependency_tag in dependency_tags:
+        for dependency_tag, dependency_file_environment in dependency_tags.items():
             if not _wheel_tags_overlap(provider_tag, dependency_tag):
                 continue
             shared_environment = intersection(
                 provider_environment,
                 dependency_python_environment,
-                _wheel_tag_environment(dependency_tag),
+                dependency_file_environment,
             )
             if not shared_environment.is_empty():
                 return True
@@ -916,7 +925,7 @@ def _validate_wheel_closure(
     distribution_name: str,
     selected_conditions: Mapping[tuple[str, str], BaseMarker],
     release_python_environments: Mapping[tuple[str, str], BaseMarker],
-    release_wheel_tags: Mapping[tuple[str, str], frozenset[Tag]],
+    release_wheel_tags: Mapping[tuple[str, str], WheelEnvironments],
     *,
     environment: BaseMarker,
 ) -> None:
@@ -934,10 +943,12 @@ def _validate_wheel_closure(
             (
                 tag,
                 intersection(
-                    release_python_environments[key], _wheel_tag_environment(tag)
+                    release_python_environments[key], file_environment
                 ),
             )
-            for tag in sorted(release_wheel_tags[key], key=str)
+            for tag, file_environment in sorted(
+                release_wheel_tags[key].items(), key=lambda item: str(item[0])
+            )
         )
         for key in releases
     }
@@ -1328,7 +1339,7 @@ def _release_metadata(
     parent_distribution: str,
     package_index: str,
     client: JsonMetadataClient,
-) -> tuple[str, BaseMarker, Mapping[str, object], frozenset[Tag]]:
+) -> tuple[str, BaseMarker, Mapping[str, object], WheelEnvironments]:
     distribution_name, requested_version = _exact_index_requirement(
         requirement, parent_distribution
     )
@@ -1413,7 +1424,7 @@ def _validate_public_wheel_closure(
     python_environment: BaseMarker,
     selected_conditions: Mapping[tuple[str, str], BaseMarker],
     release_python_environments: Mapping[tuple[str, str], BaseMarker],
-    release_wheel_tags: Mapping[tuple[str, str], frozenset[Tag]],
+    release_wheel_tags: Mapping[tuple[str, str], WheelEnvironments],
 ) -> None:
     # Keep these separate from the caller's TestPyPI pins: public dependencies
     # participate in validation, never in the TestPyPI installation step.
@@ -1424,7 +1435,7 @@ def _validate_public_wheel_closure(
 
     def load(
         requirement: Requirement,
-    ) -> tuple[str, BaseMarker, Mapping[str, object], frozenset[Tag]]:
+    ) -> tuple[str, BaseMarker, Mapping[str, object], WheelEnvironments]:
         return _release_metadata(
             requirement,
             parent_distribution=distribution_name,
@@ -1451,7 +1462,15 @@ def _validate_public_wheel_closure(
             environments[key] = intersection(
                 environments.get(key, AnyMarker()), release_environment
             )
-            wheel_tags[key] = wheel_tags.get(key, tags) & tags
+            previous = wheel_tags.get(key)
+            wheel_tags[key] = (
+                tags
+                if previous is None
+                else {
+                    tag: intersection(previous[tag], tags[tag])
+                    for tag in previous.keys() & tags.keys()
+                }
+            )
 
     _validate_wheel_closure(
         distribution_name,
@@ -1524,7 +1543,7 @@ def _testpypi_install_arguments(
     version_text: str,
     requires_python: object,
     requirements: tuple[Requirement, ...],
-    provider_wheel_tags: frozenset[Tag],
+    provider_wheel_tags: WheelEnvironments,
     client: JsonMetadataClient,
     public_resolver: PublicDependencyResolver,
 ) -> list[list[str]]:
@@ -1549,7 +1568,7 @@ def _testpypi_install_arguments(
     release_python_environments: dict[tuple[str, str], BaseMarker] = {
         root_key: python_environment
     }
-    release_wheel_tags: dict[tuple[str, str], frozenset[Tag]] = {
+    release_wheel_tags: dict[tuple[str, str], WheelEnvironments] = {
         root_key: provider_wheel_tags
     }
     release_aliases: dict[tuple[str, str], tuple[str, str]] = {}
@@ -1789,7 +1808,7 @@ def _installation_metadata(
     package_index: str,
     package: Mapping[str, object],
     requirements: tuple[Requirement, ...],
-    provider_wheel_tags: frozenset[Tag],
+    provider_wheel_tags: WheelEnvironments,
     client: JsonMetadataClient,
     public_resolver: PublicDependencyResolver,
 ) -> dict[str, object]:

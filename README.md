@@ -91,7 +91,11 @@ release must also support every Python environment in that range where its
 incoming condition is active; an incompatible `Requires-Python` closure fails
 the build. A bounded search also requires a common environment for the entire
 internal wheel closure, including the effective conditions of each release;
-pairwise overlap alone is insufficient. After public resolution, the exact PyPI
+pairwise overlap alone is insufficient. Each wheel file's `Requires-Python`
+is intersected with its tag environment, in
+addition to the release-level constraint. Files sharing a tag remain alternative
+environments, including disjoint Python ranges; they are not collapsed into one
+broader range. After public resolution, the exact PyPI
 release wheel metadata is fetched concurrently and added to the same common-
 environment check, with each lock marker preserved. A universal public lock
 alone does not prove compatibility with a provider's platform. Public pins

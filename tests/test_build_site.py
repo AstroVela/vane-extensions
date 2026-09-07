@@ -566,6 +566,7 @@ def _package_response(
     requires_dist: list[str] | None = None,
     requires_python: str | None = ">=3.10,<3.15",
     wheel_tags: tuple[str, ...] | None = None,
+    file_requires_python: tuple[str | None, ...] | None = None,
 ) -> dict[str, object]:
     wheel_distribution = distribution_name.replace("-", "_")
     selected_wheel_tags = (
@@ -589,6 +590,11 @@ def _package_response(
                     "packagetype": "bdist_wheel",
                     "yanked": False,
                     "filename": f"{wheel_distribution}-{version}-{wheel_tag}.whl",
+                    **(
+                        {"requires_python": file_requires_python[index]}
+                        if file_requires_python is not None
+                        else {}
+                    ),
                     "upload_time_iso_8601": (
                         f"2026-09-02T11:{index:02d}:00Z"
                     ),
@@ -623,6 +629,7 @@ def _release_response(
     *,
     requires_python: str | None = ">=3.10,<3.15",
     wheel_tags: tuple[str, ...] | None = None,
+    file_requires_python: tuple[str | None, ...] | None = None,
 ) -> dict[str, object]:
     return _package_response(
         distribution_name,
@@ -630,6 +637,7 @@ def _release_response(
         requires_dist=requires_dist,
         requires_python=requires_python,
         wheel_tags=wheel_tags,
+        file_requires_python=file_requires_python,
     )
 
 
@@ -1639,6 +1647,148 @@ class BuildSiteTests(unittest.TestCase):
                     generated_at=GENERATED_AT,
                     client=_FakeMetadataClient(responses),
                 )
+
+    def test_file_requires_python_must_match_each_wheel_tag(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        tag = "cp310-none-manylinux_2_28_x86_64"
+        for incompatible in (distribution, "vane-ai", "public-sdk"):
+            responses = {
+                f"https://api.github.com/repos/{slug}": _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                    distribution,
+                    requires_dist=[]
+                    if incompatible == distribution
+                    else [f"{incompatible}==1.0"],
+                    wheel_tags=(tag,),
+                    file_requires_python=(">=3.12",)
+                    if incompatible == distribution
+                    else None,
+                ),
+            }
+            if incompatible != distribution:
+                index = "test.pypi.org" if incompatible == "vane-ai" else "pypi.org"
+                responses[f"https://{index}/pypi/{incompatible}/1.0/json"] = (
+                    _release_response(
+                        incompatible,
+                        "1.0",
+                        [],
+                        wheel_tags=(tag,),
+                        file_requires_python=(">=3.12",),
+                    )
+                )
+            with (
+                self.subTest(incompatible=incompatible),
+                self.assertRaisesRegex(
+                    SiteBuildError, "wheel compatible with its Requires-Python"
+                ),
+            ):
+                build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=_FakeMetadataClient(responses),
+                    public_resolver=_FakePublicDependencyResolver(
+                        ("public-sdk==1.0",) if incompatible == "public-sdk" else ()
+                    ),
+                )
+
+    def test_file_requires_python_constrains_the_entire_wheel_closure(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        for package_index, dependency in (
+            ("testpypi", "vane-ai"),
+            ("testpypi", "public-sdk"),
+            ("pypi", "public-sdk"),
+        ):
+            manifest["package_index"] = package_index
+            index = "test.pypi.org" if package_index == "testpypi" else "pypi.org"
+            dependency_index = (
+                "test.pypi.org" if dependency == "vane-ai" else "pypi.org"
+            )
+            package = _package_response(
+                distribution,
+                requires_dist=[f"{dependency}==1.0"],
+                wheel_tags=("py3-none-any",),
+                file_requires_python=("<3.12",),
+            )
+            responses = {
+                f"https://api.github.com/repos/{slug}": _github_response(repository),
+                f"https://{index}/pypi/{distribution}/json": package,
+                f"https://{dependency_index}/pypi/{dependency}/1.0/json": _release_response(
+                    dependency,
+                    "1.0",
+                    [],
+                    wheel_tags=("py3-none-any",),
+                    file_requires_python=(">=3.12",),
+                ),
+            }
+            public_lock = ("public-sdk==1.0",) if dependency == "public-sdk" else ()
+            if package_index == "pypi":
+                responses[f"https://pypi.org/pypi/{distribution}/0.2.0/json"] = package
+                responses[
+                    f"https://pypistats.org/api/packages/{distribution}/recent"
+                ] = None
+                public_lock = (*public_lock, f"{distribution}==0.2.0")
+            with (
+                self.subTest(package_index=package_index, dependency=dependency),
+                self.assertRaises(SiteBuildError),
+            ):
+                build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=_FakeMetadataClient(responses),
+                    public_resolver=_FakePublicDependencyResolver(public_lock),
+                )
+
+    def test_files_sharing_a_tag_keep_alternative_python_environments(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        for file_ranges, minor, succeeds in (
+            (("<3.11", ">=3.13"), 10, True),
+            (("<3.11", ">=3.13"), 12, False),
+            (("<3.11", ">=3.13"), 13, True),
+            ((">=3.14,<3.12", None), 12, True),
+            (("", None), 12, True),
+        ):
+            package = _package_response(
+                distribution,
+                requires_dist=["vane-ai==1.0"],
+                wheel_tags=("py3-none-any", "py3-none-any"),
+                file_requires_python=file_ranges,
+            )
+            # A second build of the same release can advertise the same tag.
+            package["urls"][1]["filename"] = package["urls"][1]["filename"].replace(
+                "-0.2.0-", "-0.2.0-1-"
+            )
+            responses = {
+                f"https://api.github.com/repos/{slug}": _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": package,
+                "https://test.pypi.org/pypi/vane-ai/1.0/json": _release_response(
+                    "vane-ai",
+                    "1.0",
+                    [],
+                    wheel_tags=(f"cp3{minor}-none-manylinux_2_28_x86_64",),
+                ),
+            }
+            arguments = {
+                "manifest_root": self._single_manifest_root(manifest),
+                "generated_at": GENERATED_AT,
+                "client": _FakeMetadataClient(responses),
+                "public_resolver": _FakePublicDependencyResolver(()),
+            }
+            with self.subTest(file_ranges=file_ranges, minor=minor):
+                if succeeds:
+                    detail = build_details(**arguments)[0]
+                    self.assertIsNotNone(detail["installation"]["posix_install_script"])
+                else:
+                    with self.assertRaises(SiteBuildError):
+                        build_details(**arguments)
 
     def test_testpypi_provider_wheel_must_match_requires_python(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
