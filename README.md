@@ -86,9 +86,11 @@ filenames are parsed by `packaging`; `dep-logic` reduces compound extra markers
 without tying recipes to the build machine. Conditions on exact Vane-owned
 dependencies are preserved and propagated through their dependency graph;
 different versions are accepted only when their effective conditions do not
-overlap within the provider's `Requires-Python` range. Every selected internal
-release must also support every Python environment in that range where its
-incoming condition is active; an incompatible `Requires-Python` closure fails
+overlap within the provider's actual wheel environments and `Requires-Python`
+range. Requirements that cannot apply to any provider wheel are skipped before
+fetching or validating their releases. Every selected internal release must
+also support the provider environments where its incoming condition is active;
+an incompatible `Requires-Python` closure fails
 the build. A bounded search also requires a common environment for the entire
 internal wheel closure, including the effective conditions of each release;
 pairwise overlap alone is insufficient. Each wheel file's `Requires-Python`

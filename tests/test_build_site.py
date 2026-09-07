@@ -2316,11 +2316,14 @@ class BuildSiteTests(unittest.TestCase):
                 }
                 if compatible:
                     detail = build_details(**arguments)[0]
-                    public_step, internal_step = detail["installation"][
-                        "posix_install_script"
-                    ].split(" &&\n")
-                    self.assertIn("public-sdk-0==1.0", public_step)
-                    self.assertNotIn("public-sdk", internal_step)
+                    script = detail["installation"]["posix_install_script"]
+                    if case == "inactive-platform-dependency":
+                        self.assertNotIn("public-sdk", script)
+                        self.assertEqual(arguments["public_resolver"].calls, [])
+                    else:
+                        public_step, internal_step = script.split(" &&\n")
+                        self.assertIn("public-sdk-0==1.0", public_step)
+                        self.assertNotIn("public-sdk", internal_step)
                 else:
                     with self.assertRaisesRegex(
                         SiteBuildError, "no common environment"
@@ -2387,6 +2390,142 @@ class BuildSiteTests(unittest.TestCase):
                 else:
                     with self.assertRaisesRegex(
                         SiteBuildError, "wheel closure has no common environment"
+                    ):
+                        build_details(**arguments)
+
+    def test_unreachable_provider_dependencies_are_not_fetched_or_resolved(
+        self,
+    ) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        linux = "manylinux_2_28_x86_64"
+        for condition, tag, file_python in (
+            ('sys_platform == "win32"', f"cp310-none-{linux}", None),
+            ('platform_machine == "aarch64"', f"cp310-none-{linux}", None),
+            ('implementation_name == "pypy"', f"cp310-none-{linux}", None),
+            ('python_version >= "3.12"', f"py3-none-{linux}", "<3.11"),
+        ):
+            responses = {
+                f"https://api.github.com/repos/{slug}": _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                    distribution,
+                    requires_dist=[
+                        f"vane-ai===1; {condition}",
+                        f"public-sdk>=1; {condition}",
+                    ],
+                    wheel_tags=(tag,),
+                    file_requires_python=(file_python,),
+                ),
+            }
+            client = _FakeMetadataClient(responses)
+            resolver = _FakePublicDependencyResolver(())
+            with self.subTest(condition=condition):
+                detail = build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=client,
+                    public_resolver=resolver,
+                )[0]
+                self.assertEqual(resolver.calls, [])
+                self.assertEqual({url for url, *_ in client.requests}, set(responses))
+                script = detail["installation"]["posix_install_script"]
+                self.assertIsNotNone(script)
+                self.assertNotIn("vane-ai", script)
+                self.assertNotIn("public-sdk", script)
+
+    def test_internal_python_checks_use_actual_provider_environments(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        for child_python, minor, succeeds in (
+            (">=3.10,<3.11", 10, True),
+            (">=3.11,<3.15", 14, False),
+        ):
+            responses = {
+                f"https://api.github.com/repos/{slug}": _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                    distribution,
+                    requires_dist=["vane-ai===1"],
+                    wheel_tags=("cp310-none-manylinux_2_28_x86_64",),
+                ),
+                "https://test.pypi.org/pypi/vane-ai/1/json": _release_response(
+                    "vane-ai",
+                    "1",
+                    [],
+                    requires_python=child_python,
+                    wheel_tags=(f"cp3{minor}-none-manylinux_2_28_x86_64",),
+                ),
+            }
+            arguments = {
+                "manifest_root": self._single_manifest_root(manifest),
+                "generated_at": GENERATED_AT,
+                "client": _FakeMetadataClient(responses),
+                "public_resolver": _FakePublicDependencyResolver(()),
+            }
+            with self.subTest(child_python=child_python):
+                if succeeds:
+                    self.assertIsNotNone(
+                        build_details(**arguments)[0]["installation"][
+                            "posix_install_script"
+                        ]
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        SiteBuildError, "Requires-Python is incompatible"
+                    ):
+                        build_details(**arguments)
+
+    def test_internal_version_conflicts_use_actual_provider_environments(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        slug = repository.removeprefix("https://github.com/")
+        for minors, succeeds in (((10, 14), True), ((10, 12, 14), False)):
+            responses = {
+                f"https://api.github.com/repos/{slug}": _github_response(repository),
+                f"https://test.pypi.org/pypi/{distribution}/json": _package_response(
+                    distribution,
+                    requires_dist=[
+                        'vane-ai===1; python_version < "3.14"',
+                        'vane-ai===2; python_version >= "3.11"',
+                    ],
+                    wheel_tags=tuple(
+                        f"cp3{minor}-none-manylinux_2_28_x86_64" for minor in minors
+                    ),
+                ),
+                **{
+                    f"https://test.pypi.org/pypi/vane-ai/{version}/json": _release_response(
+                        "vane-ai",
+                        version,
+                        [],
+                        requires_python=child_python,
+                        wheel_tags=("py3-none-manylinux_2_28_x86_64",),
+                    )
+                    for version, child_python in (
+                        ("1", ">=3.10,<3.14"),
+                        ("2", ">=3.11,<3.15"),
+                    )
+                },
+            }
+            arguments = {
+                "manifest_root": self._single_manifest_root(manifest),
+                "generated_at": GENERATED_AT,
+                "client": _FakeMetadataClient(responses),
+                "public_resolver": _FakePublicDependencyResolver(()),
+            }
+            with self.subTest(minors=minors):
+                if succeeds:
+                    self.assertIsNotNone(
+                        build_details(**arguments)[0]["installation"][
+                            "posix_install_script"
+                        ]
+                    )
+                else:
+                    with self.assertRaisesRegex(
+                        SiteBuildError, "dependency versions conflict"
                     ):
                         build_details(**arguments)
 

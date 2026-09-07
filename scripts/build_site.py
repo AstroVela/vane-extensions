@@ -998,7 +998,7 @@ def _validate_wheel_closure(
 def _conditioned_requirement(
     requirement: Requirement,
     inherited_condition: BaseMarker,
-    python_environment: BaseMarker,
+    environment: BaseMarker,
     distribution_name: str,
 ) -> tuple[Requirement, BaseMarker] | None:
     base_requirement = _requirement_for_base_install(requirement)
@@ -1011,7 +1011,7 @@ def _conditioned_requirement(
             else from_pkg_marker(base_requirement.marker)
         )
         condition = MultiMarker.of(inherited_condition, own_condition)
-        if MultiMarker.of(python_environment, condition).is_empty():
+        if intersection(environment, condition).is_empty():
             return None
         conditioned = copy(base_requirement)
         conditioned.marker = None
@@ -1038,11 +1038,11 @@ def _internal_pin_with_condition(
 
 
 def _conditions_overlap(
-    python_environment: BaseMarker,
+    environment: BaseMarker,
     left: BaseMarker,
     right: BaseMarker,
 ) -> bool:
-    return not MultiMarker.of(python_environment, left, right).is_empty()
+    return not intersection(environment, left, right).is_empty()
 
 
 def _parse_public_lock(
@@ -1551,9 +1551,10 @@ def _testpypi_install_arguments(
     python_environment = _python_environment_marker(
         requires_python, distribution_name
     )
-    if not _wheel_set_matches_environment(
-        provider_wheel_tags, python_environment
-    ):
+    provider_environment = intersection(
+        python_environment, MarkerUnion.of(*provider_wheel_tags.values())
+    )
+    if provider_environment.is_empty():
         _fail(
             f"{distribution_name} has no non-yanked wheel compatible with "
             "its Requires-Python on a supported registry platform"
@@ -1579,7 +1580,7 @@ def _testpypi_install_arguments(
         conditioned = _conditioned_requirement(
             raw_requirement,
             inherited_condition,
-            python_environment,
+            provider_environment,
             distribution_name,
         )
         if conditioned is None:
@@ -1636,8 +1637,8 @@ def _testpypi_install_arguments(
                 release_wheel_tags.setdefault(selected_key, child_wheel_tags)
 
         dependency_python_environment = release_python_environments[selected_key]
-        unsupported_environment = MultiMarker.of(
-            python_environment,
+        unsupported_environment = intersection(
+            provider_environment,
             condition,
             ~dependency_python_environment,
         )
@@ -1662,7 +1663,7 @@ def _testpypi_install_arguments(
                 other_key[0] == dependency_name
                 and other_key != selected_key
                 and _conditions_overlap(
-                    python_environment, condition, other_condition
+                    provider_environment, condition, other_condition
                 )
             ):
                 _fail(f"Vane dependency versions conflict for {dependency_name}")
