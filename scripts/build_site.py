@@ -754,6 +754,9 @@ def _wheel_platform_environment(platform_tag: str) -> BaseMarker:
     elif family == "macos":
         operating_system = _operating_system_environment("macos")
     else:
+        # The registry currently models Vane's Linux/macOS/Windows host
+        # families, not every platform accepted by Python's wheel syntax.
+        # An opaque tag must not stand for an arbitrary OS marker environment.
         return EmptyMarker()
     machine_environment = (
         _one_of_marker("platform_machine", architectures)
@@ -1325,7 +1328,7 @@ def _release_metadata(
     ):
         _fail(
             f"{distribution_name} has no non-yanked wheel compatible with "
-            "its Requires-Python"
+            "its Requires-Python on a supported registry platform"
         )
     return (
         reported_version,
@@ -1482,7 +1485,7 @@ def _testpypi_install_arguments(
     ):
         _fail(
             f"{distribution_name} has no non-yanked wheel compatible with "
-            "its Requires-Python"
+            "its Requires-Python on a supported registry platform"
         )
     root_key = (root_name, version_text)
     selected_conditions: dict[tuple[str, str], BaseMarker] = {

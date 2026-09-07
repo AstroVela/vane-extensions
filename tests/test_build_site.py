@@ -1533,6 +1533,54 @@ class BuildSiteTests(unittest.TestCase):
                     public_resolver=_FakePublicDependencyResolver(()),
                 )
 
+    def test_registry_platform_scope_is_explicit_for_non_desktop_wheels(self) -> None:
+        manifest = dict(_checked_in_manifest("iceberg"))
+        distribution = str(manifest["distribution_name"])
+        repository = str(manifest["repository"])
+        package_url = f"https://test.pypi.org/pypi/{distribution}/json"
+        for platform_tag in (
+            "android_27_arm64_v8a",
+            "ios_13_0_arm64_iphoneos",
+            "emscripten_3_1_73_wasm32",
+            "aix_7105_1841_64",
+            "freebsd_13_0_amd64",
+        ):
+            responses = {
+                (
+                    "https://api.github.com/repos/"
+                    f"{repository.removeprefix('https://github.com/')}"
+                ): _github_response(repository),
+                package_url: _package_response(
+                    distribution,
+                    wheel_tags=(f"cp310-none-{platform_tag}",),
+                ),
+            }
+            with self.subTest(platform_tag=platform_tag):
+                with self.assertRaisesRegex(
+                    SiteBuildError, "supported registry platform"
+                ):
+                    build_details(
+                        manifest_root=self._single_manifest_root(manifest),
+                        generated_at=GENERATED_AT,
+                        client=_FakeMetadataClient(responses),
+                        public_resolver=_FakePublicDependencyResolver(()),
+                    )
+                responses[package_url] = _package_response(
+                    distribution,
+                    wheel_tags=(
+                        f"cp310-none-{platform_tag}",
+                        "cp310-none-manylinux_2_28_x86_64",
+                    ),
+                )
+                detail = build_details(
+                    manifest_root=self._single_manifest_root(manifest),
+                    generated_at=GENERATED_AT,
+                    client=_FakeMetadataClient(responses),
+                    public_resolver=_FakePublicDependencyResolver(()),
+                )[0]
+                self.assertIn(platform_tag, detail["package"]["platform_tags"])
+                self.assertIsNotNone(detail["installation"]["posix_install_script"])
+
     def test_testpypi_rejects_disjoint_internal_wheel_environments(self) -> None:
         manifest = dict(_checked_in_manifest("iceberg"))
         distribution = str(manifest["distribution_name"])

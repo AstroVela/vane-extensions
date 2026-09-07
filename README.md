@@ -101,6 +101,14 @@ Native ABI validation covers
 CPython and PyPy; other interpreter families require ABI-independent (`none`)
 wheels. The free-threaded Stable ABI (`abi3t`) requires runtime 3.15 or later,
 following PEP 803's supported builds; experimental backports are not promised.
+Installability checks currently model Linux, macOS, and Windows host families,
+matching the OS families handled by Vane's extension-wheel platform policies.
+Platform-independent (`any`) dependency wheels are supported too. Other valid
+Python wheel platforms (such as Android, iOS, Emscripten, AIX, and FreeBSD) may
+appear in informational package metadata, but cannot establish an installable
+registry environment. A release available only on such platforms fails the
+build explicitly. This service does not add support for new Vane host platforms
+or assume that an opaque tag can satisfy arbitrary OS-dependent requirements.
 Direct-URL requirements are omitted
 from published JSON and HTML so artifact locations or embedded credentials
 cannot leak through package metadata.
