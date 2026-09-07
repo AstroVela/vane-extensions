@@ -1204,7 +1204,8 @@ class BuildSiteTests(unittest.TestCase):
                             "optional-url @ https://example.invalid/sdk.whl ; "
                             'extra == "sdk"'
                         ),
-                        'platform-marker; sys_platform == "extra"',
+                        'platform-marker; sys_platform == "linux"',
+                        'unreachable-platform-marker; sys_platform == "extra"',
                         'default-extra; extra != "openai"',
                     ],
                 )
@@ -1221,7 +1222,7 @@ class BuildSiteTests(unittest.TestCase):
             (
                 "default-extra==1.0",
                 "numpy==2.5.2",
-                'platform-marker==1.0; sys_platform == "extra"',
+                'platform-marker==1.0; sys_platform == "linux"',
                 "transitive-public==2.0",
                 "typing-extensions==4.16.0",
             )
@@ -1260,7 +1261,7 @@ class BuildSiteTests(unittest.TestCase):
                     (
                         "default-extra",
                         "numpy>=2",
-                        'platform-marker; sys_platform == "extra"',
+                        'platform-marker; sys_platform == "linux"',
                         "typing-extensions",
                     ),
                     ">=3.10,<3.15",
@@ -1277,6 +1278,7 @@ class BuildSiteTests(unittest.TestCase):
         self.assertIn("numpy==2.5.2", public_command)
         self.assertIn("typing-extensions==4.16.0", public_command)
         self.assertIn("platform-marker==1.0", public_command)
+        self.assertNotIn("unreachable-platform-marker", public_command)
         self.assertIn("default-extra==1.0", public_command)
         self.assertIn("transitive-public==2.0", public_command)
         self.assertNotIn("numpy>=2", public_command)
@@ -1301,7 +1303,7 @@ class BuildSiteTests(unittest.TestCase):
         self.assertEqual(powershell_script.count("    & 'python' '-m' 'pip'"), 2)
         self.assertEqual(powershell_script.count("if (-not $__vanePipSucceeded"), 2)
         self.assertIn(
-            "'platform-marker==1.0; sys_platform == \"extra\"'",
+            "'platform-marker==1.0; sys_platform == \"linux\"'",
             powershell_script,
         )
         self.assertIn(
